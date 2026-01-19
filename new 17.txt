@@ -2086,8 +2086,8 @@ $(document).ready(function () {
             alert("Please ensure the extra ball weights total 100%.");
             return false;
         }
-    <?php endif; ?>    // ? CLOSE the PHP if-block
-
+        <?php endif; ?>    // ? CLOSE the PHP if-block
+        return true;
     });              // ? close the JS callback now that PHP is happy
 
         
