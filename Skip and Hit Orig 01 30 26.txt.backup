@@ -603,6 +603,74 @@ function skaiRankMetrics(array $predictedRankedNums, array $actualWinners, int $
 }
 
 
+// ------------------------------------------------------------
+// NEW: Ranking-quality metrics for Top-K evaluation (Skip/Hit)
+// - Recall@K: winners captured / winners total
+// - Mean Winner Rank: average rank of winners (missing => K+1)
+// - NDCG@K: rewards winners appearing earlier in the ranking
+// - Composite score: single 0..1 value for auto-tune selection
+// ------------------------------------------------------------
+function skaiRankMetrics(array $predictedRankedNums, array $actualWinners, int $k = 20): array
+{
+    $k = max(1, $k);
+
+    // sanitize
+    $actualWinners = array_values(array_filter($actualWinners, function($v){
+        return $v !== null && $v !== '';
+    }));
+
+    $pickCount = count($actualWinners);
+    if ($pickCount < 1) { $pickCount = 5; } // safe fallback
+
+    $predTop = array_slice($predictedRankedNums, 0, $k);
+
+    // matches in Top-K
+    $matches = count(array_intersect($predTop, $actualWinners));
+
+    // Recall@K
+    $recall = $matches / $pickCount;
+
+    // winner ranks (1..K), missing => K+1
+    $winnerRanks = [];
+    foreach ($actualWinners as $w) {
+        $pos = array_search($w, $predTop, true); // 0-based
+        $winnerRanks[] = ($pos !== false) ? ($pos + 1) : ($k + 1);
+    }
+
+    $meanRank = !empty($winnerRanks)
+        ? (array_sum($winnerRanks) / count($winnerRanks))
+        : ($k + 1);
+
+    // NDCG@K with binary gain (each winner = 1)
+    $dcg = 0.0;
+    foreach ($winnerRanks as $r) {
+        if ($r >= 1 && $r <= $k) {
+            $dcg += 1.0 / (log($r + 1) / log(2));
+        }
+    }
+    $ideal = min($pickCount, $k);
+    $idcg = 0.0;
+    for ($i = 1; $i <= $ideal; $i++) {
+        $idcg += 1.0 / (log($i + 1) / log(2));
+    }
+    $ndcg = ($idcg > 0.0) ? ($dcg / $idcg) : 0.0;
+
+    // Turn mean rank into 0..1 “rankScore”
+    $rankScore = 1.0 - (min($meanRank, $k + 1) / ($k + 1));
+
+    // Composite objective:
+    // - prioritize capture (recall)
+    // - reward early placement (ndcg + rankScore)
+    $score = (0.50 * $recall) + (0.35 * $ndcg) + (0.15 * $rankScore);
+
+    return [
+        'matches'   => $matches,
+        'recall'    => $recall,
+        'mean_rank' => $meanRank,
+        'ndcg'      => $ndcg,
+        'score'     => $score,
+    ];
+}
 
 // Normalize current skips
 
@@ -738,6 +806,69 @@ function skaiTuneWeightsOnWindow(
                 $best['recall']    = $sumRecall / $bt;
                 $best['ndcg']      = $sumNdcg / $bt;
                 $best['mean_rank'] = $sumMeanRank / $bt;
+            }
+        }
+    }
+
+    return $best;
+}
+function skaiTuneWeightsOnWindow(array $fullHistory, array $mainBallColumns, int $window, int $backtestCount): array
+{
+    // Coarse grid (fast, stable). You can tighten later.
+    $grid = [0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80];
+
+    $best = [
+        'score'   => -1,
+        'weights' => ['frequency'=>0.4,'skip'=>0.3,'historical'=>0.3],
+    ];
+
+    $totalDraws = count($fullHistory);
+    if ($totalDraws < 20) return $best;
+
+    $bt = min($backtestCount, $totalDraws - 1);
+    if ($bt < 5) return $best;
+
+    foreach ($grid as $f) {
+        foreach ($grid as $s) {
+            $h = 1.0 - ($f + $s);
+            if ($h < 0.10 || $h > 0.80) continue; // keep reasonable combos
+
+            $weights = ['frequency'=>$f,'skip'=>$s,'historical'=>$h];
+
+            $sumMatches = 0;
+
+            for ($i = 1; $i <= $bt; $i++) {
+                $testIndex = $totalDraws - $i;
+
+                // Training slice of exactly $window draws ending before testIndex
+                $start = max(0, $testIndex - $window);
+                $trainingSet = array_slice($fullHistory, $start, $window, true);
+
+                list($_, $drawCounts, $_2, $prevIndex, $histProbs) =
+                    calculateSkipsAndProbabilities($trainingSet);
+
+                // Current skips
+                $currentSkips = [];
+                foreach ($prevIndex as $num => $idx) {
+                    $currentSkips[$num] = $window - $idx - 1;
+                }
+
+                $totalEvents = $window * count($mainBallColumns);
+
+                // Score and pick Top 20
+                $scores = calculateNumberScores($drawCounts, $currentSkips, $histProbs, $totalEvents, $weights);
+                arsort($scores);
+                $predicted = array_slice(array_keys($scores), 0, 20);
+
+                // Compare
+                $actual = $fullHistory[$testIndex]['numbers'];
+                $sumMatches += count(array_intersect($predicted, $actual));
+            }
+
+            $avg = ($bt > 0) ? ($sumMatches / $bt) : 0;
+            if ($avg > $best['score']) {
+                $best['score'] = $avg;
+                $best['weights'] = $weights;
             }
         }
     }
