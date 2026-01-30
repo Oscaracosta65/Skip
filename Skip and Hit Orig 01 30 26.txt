@@ -1,0 +1,2662 @@
+
+{source}
+<?php
+// Enable detailed error reporting
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+// Set Content-Security-Policy header
+header("Content-Security-Policy: "
+  . "default-src 'self'; "
+  . "script-src 'self' 'unsafe-inline' "
+      . "https://code.jquery.com "
+      . "https://cdn.datatables.net "
+      . "https://*.google.com "
+      . "https://pagead2.googlesyndication.com "
+      . "https://www.googletagmanager.com "
+      . "https://www.gstatic.com; "
+  . "style-src 'self' 'unsafe-inline' "
+      . "https://fonts.googleapis.com "
+      . "https://cdn.datatables.net; "
+  . "font-src 'self' https://fonts.gstatic.com; "
+  . "img-src 'self' data: "
+      . "https://*.google.com "
+      . "https://googleads.g.doubleclick.net "
+      . "https://stats.g.doubleclick.net; "    // allow DC analytics images
+  . "connect-src 'self' "
+      . "https://stats.g.doubleclick.net "     // allow DC analytics XHR
+      . "https://www.google.com/recaptcha/ "  // allow reCAPTCHA API calls
+      . "https://www.gstatic.com/recaptcha/; "
+  . "frame-src "
+      . "https://*.google.com "
+      . "https://pagead2.googlesyndication.com "
+      . "https://www.google.com/recaptcha/;"
+);
+
+// Secure session cookies
+if (session_status() === PHP_SESSION_NONE) {
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path'     => '/',
+        'domain'   => '',
+        'secure'   => true,
+        'httponly' => true,
+        'samesite' => 'Lax'
+    ]);
+}
+
+// Joomla bootstrap
+if (!defined('_JEXEC')) define('_JEXEC', 1);
+if (!defined('JPATH_BASE')) define('JPATH_BASE', realpath(dirname(__FILE__) . '/../../'));
+require_once JPATH_BASE . '/includes/defines.php';
+require_once JPATH_BASE . '/includes/framework.php';
+use Joomla\CMS\Factory;
+use Joomla\CMS\Session\Session;
+use Joomla\CMS\HTML\HTMLHelper;
+
+$app        = Factory::getApplication('site');
+$currUser   = Factory::getUser();
+$userGroups = $currUser->groups ?? [];
+// $allowedGroups       = [1, 2, 9, 13, 14];
+$allowedGroups       = [14];
+$userIsInAllowedGroup = (bool) array_intersect($allowedGroups, $userGroups);
+
+// Mirror the “can save” flag for your JS logic
+$saveable = $userIsInAllowedGroup;
+
+
+
+
+// Load config JSON
+$masterJsonPath = '/home/oscara/web/lottoexpert.net/public_html/lottery_skip_config.json';
+if (!file_exists($masterJsonPath)) die("Master configuration file not found.");
+$masterConfig = json_decode(file_get_contents($masterJsonPath), true);
+
+// -- Read lottery ID from URL (no fallback) -----------------------------
+// $requestedId = $app->input->getString('game_id', '');
+$requestedId = $app->input->getString('game_id', '');
+
+// TEMP fallback: only use NY5 if no game_id is present in the URL
+if (empty($requestedId)) {
+    $requestedId = '101';
+}
+
+
+// If the user didn’t supply game_id, bail out early
+if (empty($requestedId)) {
+    $app->enqueueMessage('No game_id specified in URL.', 'error');
+    return;
+}
+$selectedGameId = strtoupper(trim($requestedId)); // now purely from the URL
+// -- End lottery ID block ------------------------------------------------
+
+
+?>
+
+<?php /* [[div class="panel" style="margin-top:20px; margin-bottom:30px;"]]
+  [[div class="panel-header"]]Switch Lottery[[/div]]
+  [[form method="get"]]
+    [[label for="game_id" style="font-weight:bold; display:block; margin-bottom:8px;"]]
+      Select a lottery to analyze:
+    [[/label]]
+    [[select name="game_id" id="game_id" onchange="this.form.submit()" style="width:100%; padding:10px; font-size:14px; border:2px solid #007bff; border-radius:5px;"]]
+      [[option disabled selected]]Choose a lottery[[/option]]
+      <?php foreach ($masterConfig['lotteries'] as $gid => $lotto): ?>
+        <?php
+          $selected = ($gid === $selectedGameId) ? 'selected' : '';
+          $name = htmlspecialchars($lotto['lotteryName']);
+        ?>
+        [[option value="<?php echo $gid; ?>" <?php echo $selected; ?>]]
+          <?php echo $name . ' (' . $gid . ')'; ?>
+        [[/option]]
+      <?php endforeach; ?>
+    [[/select]]
+  [[/form]]
+[[/div]] */ ?>
+
+
+
+
+<?php
+
+
+if (!isset($masterConfig['lotteries'][$selectedGameId])) {
+    $app->enqueueMessage(
+        'Lottery configuration not found for game_id: '
+        . htmlspecialchars($selectedGameId, ENT_QUOTES, 'UTF-8'),
+        'error'
+    );
+    return;
+}
+
+// Retrieve config (safe to do here because it passed the above check)
+$config             = $masterConfig['lotteries'][$selectedGameId];
+$dbCol              = $config['dbCol'];
+$gameId             = $config['gameId'];
+$lotteryId          = $config['gameId'];
+$lotteryName        = $config['lotteryName'];
+$lotteryConfig      = $config['lotteryConfig'];
+$defaultFreqWeight  = $config['defaultWeights']['frequency'];
+$defaultSkipWeight  = $config['defaultWeights']['skip'];
+$defaultHistWeight  = $config['defaultWeights']['historical'];
+
+// Determine columns
+$mainBallColumns = (array) $lotteryConfig['main_ball_columns'];
+$extraBallColumns = $lotteryConfig['has_extra_ball']
+    ? (isset($lotteryConfig['extra_ball_columns'])
+        ? (array) $lotteryConfig['extra_ball_columns']
+        : [$lotteryConfig['extra_ball_column']])
+    : [];
+$selectColumns = array_merge($mainBallColumns, $extraBallColumns, ['draw_date']);
+
+
+// ----------------------------------------------------------------------------
+// ---- FIX: Fetch the true lottery_id FROM #__lotteries based on game_id -----
+// ----------------------------------------------------------------------------
+$db = Factory::getDbo();
+$q = $db->getQuery(true)
+    ->select($db->quoteName('lottery_id'))
+    ->from($db->quoteName('#__lotteries'))
+    ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+    ->setLimit(1);
+$db->setQuery($q);
+$lotteryId = (int) $db->loadResult();
+if ($lotteryId === 0) {
+    die('Cannot find lottery_id for game_id: ' . htmlspecialchars($gameId, ENT_QUOTES, 'UTF-8'));
+}
+// ----------------------------------------------------------------------------
+// End of FIX
+// ----------------------------------------------------------------------------
+
+// User inputs
+// User inputs
+$numDraws    = $app->input->getInt('num_draws', 0);
+$enableExtra = $app->input->getInt('enable_extra', 1);
+// NEW: Pure Math (Skip–Hit only) toggle: 0=off (default), 1=on
+$pureMode    = $app->input->getInt('pure_mode', 0);
+
+
+// Auto-tune flag
+$tune = $app->input->getInt('tune', 0);
+
+// -- FIX: Clear tune mode on any POST so Save always runs in normal mode
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $tune = 0;
+    $app->input->set('tune', 0);
+}
+
+// -- Force-off auto-tune when Pure Math (pure_mode) is enabled -----
+if ((int) $pureMode === 1) {
+    $tune = 0;
+    $app->input->set('tune', 0);
+}
+
+// When tuning, always fetch full history regardless of num_draws
+if ($tune) {
+    $numDraws = 0;
+}
+
+// --- Main Weights ---
+$freqWeightInput = $app->input->getFloat('freq_weight', $defaultFreqWeight);
+$skipWeightInput = $app->input->getFloat('skip_weight', $defaultSkipWeight);
+$histWeightInput = $app->input->getFloat('hist_weight', $defaultHistWeight);
+$freqWeight = $freqWeightInput / 100.0;
+$skipWeight = $skipWeightInput / 100.0;
+$histWeight = $histWeightInput / 100.0;
+$total = $freqWeight + $skipWeight + $histWeight;
+if ($total == 0) {
+    $freqWeight = 0.4; $skipWeight = 0.3; $histWeight = 0.3;
+} elseif (abs($total - 1.0) > 0.0001) {
+    $freqWeight /= $total; $skipWeight /= $total; $histWeight /= $total;
+}
+$weights = ['frequency'=>$freqWeight, 'skip'=>$skipWeight, 'historical'=>$histWeight];
+
+// --- Extra Ball Weights ---
+$pbFreqWeightInput = $app->input->getFloat('pb_freq_weight', $defaultFreqWeight);
+$pbSkipWeightInput = $app->input->getFloat('pb_skip_weight', $defaultSkipWeight);
+$pbHistWeightInput = $app->input->getFloat('pb_hist_weight', $defaultHistWeight);
+$pbFreqWeight = $pbFreqWeightInput / 100.0;
+$pbSkipWeight = $pbSkipWeightInput / 100.0;
+$pbHistWeight = $pbHistWeightInput / 100.0;
+$totalPb = $pbFreqWeight + $pbSkipWeight + $pbHistWeight;
+if ($totalPb == 0) {
+    $pbFreqWeight = 0.4; $pbSkipWeight = 0.3; $pbHistWeight = 0.3;
+} elseif (abs($totalPb - 1.0) > 0.0001) {
+    $pbFreqWeight /= $totalPb; $pbSkipWeight /= $totalPb; $pbHistWeight /= $totalPb;
+}
+$pbWeights = ['frequency'=>$pbFreqWeight, 'skip'=>$pbSkipWeight, 'historical'=>$pbHistWeight];
+
+// Fetch latest results
+$query = $db->getQuery(true)
+    ->select($db->quoteName($selectColumns))
+    ->from($db->quoteName($dbCol))
+    ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+    ->order($db->quoteName('draw_date') . ' DESC');
+// PROTECT against timeouts by capping results
+// if (!$tune && $numDraws <= 0) {
+//    $query->setLimit(1000);  // or adjust as needed
+// }
+
+$db->setQuery($query);
+$latestResult = $db->loadObjectList();
+
+// -- LIMIT DATA TO DRAWS AFTER A CERTAIN DATE -------------------------
+// ? Filter out draws older than a hard cutoff date
+$cutoffDate = '2010-01-01';
+$latestResult = array_filter($latestResult, function ($row) use ($cutoffDate) {
+    return strtotime($row->draw_date) >= strtotime($cutoffDate);
+});
+
+// ---------------------------------------------------------------------
+
+
+$nextDrawQuery = $db->getQuery(true)
+    ->select($db->quoteName('next_draw_date'))
+    ->from($db->quoteName($dbCol))
+    ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+    ->order($db->quoteName('draw_date') . ' DESC')
+    ->setLimit(1);
+
+$db->setQuery($nextDrawQuery);
+$nextDrawDate = $db->loadResult();
+
+// ----------------------------------------------------------------------------
+// Handle Save Number Set – place this *right here*, before ANY HTML output
+if ($_SERVER['REQUEST_METHOD'] === 'POST'
+    && Session::checkToken()
+    && isset($_POST['save_set'])
+) {
+    try {
+    // 1) Read lottery_id from POST
+    $postedLotteryId = (int) ($_POST['lottery_id'] ?? 0);
+
+    // 2) Validate that this lottery_id exists in #__lotteries
+    $vQ = $db->getQuery(true)
+        ->select('COUNT(*)')
+        ->from($db->quoteName('#__lotteries'))
+        ->where($db->quoteName('lottery_id') . ' = ' . $db->quote($postedLotteryId));
+    $db->setQuery($vQ);
+    $exists = (int) $db->loadResult();
+    if ($exists !== 1) {
+        $app->enqueueMessage('Invalid lottery selected.', 'error');
+echo '<!-- lottery_id being posted: ' . htmlspecialchars($postedLotteryId) . ' -->';
+
+        die('Invalid lottery_id: ' . htmlspecialchars($postedLotteryId, ENT_QUOTES, 'UTF-8'));
+    }
+
+    // 3) Proceed with gathering other fields
+    $lottery_id         = $postedLotteryId;                                          // -- FIX
+    // Keep the raw method key and the EXACT label string shown to the user
+    $sourceKey = trim($_POST['source']);  // "skip_hit", "ai_prediction", "mcmc_prediction"
+    $source    = $db->quote($sourceKey);
+
+    // Use the UI label that includes timestamp/mode, etc.
+    $labelTextPosted = trim($_POST['label'] ?? '');
+    $label           = $db->quote($labelTextPosted);
+
+    $main_numbers       = $db->quote(trim($_POST['main_numbers']));
+    $extra_ball_numbers = $db->quote(trim($_POST['extra_ball_numbers']));
+    $draws_analyzed     = (int) $_POST['draws_analyzed'];
+    $generated_at       = $db->quote(trim($_POST['generated_at']));
+    $next_draw_date     = $db->quote(trim($_POST['next_draw_date'] ?? ''));
+
+    $freq_w            = (float) $_POST['freq_weight'];
+    $skip_w            = (float) $_POST['skip_weight'];
+    $hist_w            = (float) $_POST['hist_weight'];
+
+    // Only include extra-ball weights if provided
+    $pb_freq_w         = isset($_POST['pb_freq_weight'])
+                         ? (float) $_POST['pb_freq_weight']
+                         : 0;
+    $pb_skip_w         = isset($_POST['pb_skip_weight'])
+                         ? (float) $_POST['pb_skip_weight']
+                         : 0;
+    $pb_hist_w         = isset($_POST['pb_hist_weight'])
+                         ? (float) $_POST['pb_hist_weight']
+                         : 0;
+
+    // NEW: persist the analysis settings actually used
+    $draws_used  = (int) ($_POST['draws_used'] ?? 0);       // training window actually used
+    $tune_used   = (int) ($_POST['tune_used']  ?? 0);       // 1 if Auto-Tune was active for this run, else 0
+    $best_window = isset($_POST['best_window']) && $_POST['best_window'] !== ''
+                   ? (int) $_POST['best_window']
+                   : null;                                   // null when manual mode/no tuning
+
+    $date_saved   = $db->quote(date('Y-m-d H:i:s'));
+
+
+    // Adjust the INSERT columns to include those new weight fields
+$columns = [
+    'user_id','lottery_id','main_numbers','extra_ball_numbers',
+    'source','label','draws_analyzed','generated_at','next_draw_date','date_saved',
+    'freq_weight','skip_weight','hist_weight',
+    'pure_mode',
+    'draws_used',      // NEW
+    'tune_used',       // NEW
+    'best_window'      // NEW (nullable)
+];
+
+
+    $values =  (int)$currUser->id
+             . ", $lottery_id"                       // -- FIX
+             . ", $main_numbers"
+             . ", $extra_ball_numbers"
+             . ", $source"
+             . ", $label"
+             . ", $draws_analyzed"
+             . ", $generated_at"
+             . ", $next_draw_date"
+             . ", $date_saved"
+             . ", " . $db->quote($freq_w)
+             . ", " . $db->quote($skip_w)
+             . ", " . $db->quote($hist_w)
+             . ", " . (int)$pureMode
+             . ", " . (int)$draws_used
+             . ", " . (int)$tune_used
+             . ", " . ($best_window !== null ? (int)$best_window : "NULL");
+
+
+    // If extra ball is enabled, also insert those fields
+    if ($enableExtra && $lotteryConfig['has_extra_ball']) {
+        $columns[] = 'pb_freq_weight';
+        $columns[] = 'pb_skip_weight';
+        $columns[] = 'pb_hist_weight';
+        $values   .= ", " . $db->quote($pb_freq_w)
+                   . ", " . $db->quote($pb_skip_w)
+                   . ", " . $db->quote($pb_hist_w);
+    }
+
+    $insert = $db->getQuery(true)
+        ->insert('#__user_saved_numbers')
+        ->columns($columns)
+        ->values($values);
+
+//added Oscar
+$db->setQuery($insert)->execute();
+
+        $app->enqueueMessage('Number set saved successfully.');
+        $app->redirect('https://lottoexpert.net/membership/my-dashboard');
+        exit;
+
+    } catch (Exception $e) {
+        $app->enqueueMessage('Error saving number set: ' . $e->getMessage(), 'error');
+    }
+}
+
+
+
+// ----------------------------------------------------------------------------
+
+// Process draw data into arrays
+$powerballData       = [];
+$powerballNumberData = [];
+if (!empty($latestResult)) {
+    foreach ($latestResult as $row) {
+        $date = date('Y-m-d', strtotime($row->draw_date));
+        // main numbers
+        $mainNumbers = [];
+        foreach ($mainBallColumns as $col) {
+            $v = $row->$col;
+            $nums = strpos($v, ',') !== false
+                ? array_map('trim', explode(',', $v))
+                : [$v];
+            // Normalize tokens so '01' and '1' share the same key (int 1); keep 0 exact
+            foreach ($nums as $tok) {
+                $tok = trim((string)$tok);
+                if ($tok === '0') {
+                    $mainNumbers[] = 0;
+                } else {
+                    $mainNumbers[] = (int) ltrim($tok, '0');
+                }
+            }
+        }
+        sort($mainNumbers, SORT_NUMERIC);
+        $powerballData[] = ['numbers'=>$mainNumbers, 'date'=>$date];
+        // extra ball (normalize like mains)
+        $extraRaw = $extraBallColumns
+            ? $row->{$extraBallColumns[0]}
+            : null;
+        $extra = null;
+        if ($extraRaw !== null && $extraRaw !== '') {
+            $tok = trim((string)$extraRaw);
+            $extra = ($tok === '0') ? 0 : (int) ltrim($tok, '0');
+        }
+        $powerballNumberData[] = ['number'=>$extra, 'date'=>$date];
+    }
+}
+$powerballData       = array_reverse($powerballData);
+$powerballNumberData = array_reverse($powerballNumberData);
+// keep a copy of the full history for back-testing
+$fullMainHistory  = $powerballData;
+$fullExtraHistory = $powerballNumberData;
+
+
+// Function to calculate skips & historical probabilities
+// Function to calculate skips & historical probabilities (wrapped in a guard)
+if (! function_exists('calculateSkipsAndProbabilities')) {
+    function calculateSkipsAndProbabilities(array $data, bool $single = false): array
+    {
+ 
+
+    $skips = [];
+    $previousIndex = [];
+    $drawCounts = [];
+    $lastDrawDate = [];
+    $historicalProbabilities = [];
+    foreach ($data as $i => $draw) {
+        $nums = $single ? [$draw['number']] : $draw['numbers'];
+        foreach ($nums as $n) {
+            $drawCounts[$n] = ($drawCounts[$n] ?? 0) + 1;
+            if (isset($previousIndex[$n])) {
+                $skip = $i - $previousIndex[$n] - 1;
+                $skips[$n][$skip] = ($skips[$n][$skip] ?? 0) + 1;
+            } else {
+                $skips[$n][0] = ($skips[$n][0] ?? 0) + 1;
+            }
+            $previousIndex[$n] = $i;
+            $lastDrawDate[$n] = $draw['date'];
+        }
+    }
+    foreach ($skips as $n => $skipData) {
+        $total = array_sum($skipData);
+        foreach ($skipData as $skip => $count) {
+            $historicalProbabilities[$n][$skip] = $count / $total;
+        }
+    }
+    ksort($skips);
+    return [$skips, $drawCounts, $lastDrawDate, $previousIndex, $historicalProbabilities];
+}
+
+}
+
+
+
+
+
+
+// Calculate skip info
+list($mainSkips, $mainDrawCounts, $mainLastDrawDate, $mainPreviousIndex, $mainHistoricalProbabilities) =
+    calculateSkipsAndProbabilities($powerballData);
+
+if ($enableExtra && $lotteryConfig['has_extra_ball']) {
+    list($powerballSkips, $powerballDrawCounts, $powerballLastDrawDate, $powerballPreviousIndex, $powerballHistoricalProbabilities) =
+        calculateSkipsAndProbabilities($powerballNumberData, true);
+} else {
+    $powerballSkips = $powerballDrawCounts = $powerballLastDrawDate = $powerballPreviousIndex = $powerballHistoricalProbabilities = [];
+}
+
+/**
+ * Calculate composite scores for each number based on
+ * frequency, skip-distance and historical bounce-back.
+ *
+ * @param array $drawCounts      [number => how many times seen]
+ * @param array $currentSkips    [number => how many draws since last seen]
+ * @param array $histProbs       [number => [skip => probability]]
+ * @param int   $totalDraws      total “events” (draws × balls per draw)
+ * @param array $weights         ['frequency'=>float, 'skip'=>float, 'historical'=>float]
+ * @return array [number => composite score]
+ */
+function calculateNumberScores(array $drawCounts, array $currentSkips, array $histProbs, int $totalDraws, array $weights): array
+{
+    $scores = [];
+
+    // 1) No draws ? no scores
+    if ($totalDraws <= 0) {
+        return $scores;
+    }
+
+    foreach ($drawCounts as $n => $count) {
+        // frequency score
+        $freqScore = $count / $totalDraws;
+
+        // skip score (clamp negative to zero)
+        if (isset($currentSkips[$n])) {
+            $skip = $currentSkips[$n];
+        } else {
+            $skip = empty($currentSkips) ? 0 : max($currentSkips);
+        }
+        if ($skip < 0) {
+            $skip = 0;
+        }
+        $skipScore = 1 / ($skip + 1);
+
+        // historical-probability score
+        $histScore = $histProbs[$n][$skip] ?? 0;
+
+        // composite
+        $scores[$n] = $weights['frequency']  * $freqScore
+                    + $weights['skip']       * $skipScore
+                    + $weights['historical'] * $histScore;
+    }
+
+    return $scores;
+}
+
+// ------------------------------------------------------------
+// NEW: Ranking-quality metrics for Top-K evaluation (Skip/Hit)
+// - Recall@K: winners captured / winners total
+// - Mean Winner Rank: average rank of winners (missing => K+1)
+// - NDCG@K: rewards winners appearing earlier in the ranking
+// - Composite score: single 0..1 value for auto-tune selection
+// ------------------------------------------------------------
+function skaiRankMetrics(array $predictedRankedNums, array $actualWinners, int $k = 20): array
+{
+    $k = max(1, $k);
+
+    // sanitize
+    $actualWinners = array_values(array_filter($actualWinners, function($v){
+        return $v !== null && $v !== '';
+    }));
+
+    $pickCount = count($actualWinners);
+    if ($pickCount < 1) { $pickCount = 5; } // safe fallback
+
+    $predTop = array_slice($predictedRankedNums, 0, $k);
+
+    // matches in Top-K
+    $matches = count(array_intersect($predTop, $actualWinners));
+
+    // Recall@K
+    $recall = $matches / $pickCount;
+
+    // winner ranks (1..K), missing => K+1
+    $winnerRanks = [];
+    foreach ($actualWinners as $w) {
+        $pos = array_search($w, $predTop, true); // 0-based
+        $winnerRanks[] = ($pos !== false) ? ($pos + 1) : ($k + 1);
+    }
+
+    $meanRank = !empty($winnerRanks)
+        ? (array_sum($winnerRanks) / count($winnerRanks))
+        : ($k + 1);
+
+    // NDCG@K with binary gain (each winner = 1)
+    $dcg = 0.0;
+    foreach ($winnerRanks as $r) {
+        if ($r >= 1 && $r <= $k) {
+            $dcg += 1.0 / (log($r + 1) / log(2));
+        }
+    }
+    $ideal = min($pickCount, $k);
+    $idcg = 0.0;
+    for ($i = 1; $i <= $ideal; $i++) {
+        $idcg += 1.0 / (log($i + 1) / log(2));
+    }
+    $ndcg = ($idcg > 0.0) ? ($dcg / $idcg) : 0.0;
+
+    // Turn mean rank into 0..1 “rankScore”
+    $rankScore = 1.0 - (min($meanRank, $k + 1) / ($k + 1));
+
+    // Composite objective:
+    // - prioritize capture (recall)
+    // - reward early placement (ndcg + rankScore)
+    $score = (0.50 * $recall) + (0.35 * $ndcg) + (0.15 * $rankScore);
+
+    return [
+        'matches'   => $matches,
+        'recall'    => $recall,
+        'mean_rank' => $meanRank,
+        'ndcg'      => $ndcg,
+        'score'     => $score,
+    ];
+}
+
+
+// ------------------------------------------------------------
+// NEW: Ranking-quality metrics for Top-K evaluation (Skip/Hit)
+// - Recall@K: winners captured / winners total
+// - Mean Winner Rank: average rank of winners (missing => K+1)
+// - NDCG@K: rewards winners appearing earlier in the ranking
+// - Composite score: single 0..1 value for auto-tune selection
+// ------------------------------------------------------------
+function skaiRankMetrics(array $predictedRankedNums, array $actualWinners, int $k = 20): array
+{
+    $k = max(1, $k);
+
+    // sanitize
+    $actualWinners = array_values(array_filter($actualWinners, function($v){
+        return $v !== null && $v !== '';
+    }));
+
+    $pickCount = count($actualWinners);
+    if ($pickCount < 1) { $pickCount = 5; } // safe fallback
+
+    $predTop = array_slice($predictedRankedNums, 0, $k);
+
+    // matches in Top-K
+    $matches = count(array_intersect($predTop, $actualWinners));
+
+    // Recall@K
+    $recall = $matches / $pickCount;
+
+    // winner ranks (1..K), missing => K+1
+    $winnerRanks = [];
+    foreach ($actualWinners as $w) {
+        $pos = array_search($w, $predTop, true); // 0-based
+        $winnerRanks[] = ($pos !== false) ? ($pos + 1) : ($k + 1);
+    }
+
+    $meanRank = !empty($winnerRanks)
+        ? (array_sum($winnerRanks) / count($winnerRanks))
+        : ($k + 1);
+
+    // NDCG@K with binary gain (each winner = 1)
+    $dcg = 0.0;
+    foreach ($winnerRanks as $r) {
+        if ($r >= 1 && $r <= $k) {
+            $dcg += 1.0 / (log($r + 1) / log(2));
+        }
+    }
+    $ideal = min($pickCount, $k);
+    $idcg = 0.0;
+    for ($i = 1; $i <= $ideal; $i++) {
+        $idcg += 1.0 / (log($i + 1) / log(2));
+    }
+    $ndcg = ($idcg > 0.0) ? ($dcg / $idcg) : 0.0;
+
+    // Turn mean rank into 0..1 “rankScore”
+    $rankScore = 1.0 - (min($meanRank, $k + 1) / ($k + 1));
+
+    // Composite objective:
+    // - prioritize capture (recall)
+    // - reward early placement (ndcg + rankScore)
+    $score = (0.50 * $recall) + (0.35 * $ndcg) + (0.15 * $rankScore);
+
+    return [
+        'matches'   => $matches,
+        'recall'    => $recall,
+        'mean_rank' => $meanRank,
+        'ndcg'      => $ndcg,
+        'score'     => $score,
+    ];
+}
+
+// Normalize current skips
+
+$mainCurrentSkips = [];
+foreach ($mainPreviousIndex as $n => $i) {
+    $mainCurrentSkips[$n] = count($powerballData) - $i - 1;
+}
+$powerballCurrentSkips = [];
+foreach ($powerballPreviousIndex as $n => $i) {
+    $powerballCurrentSkips[$n] = count($powerballNumberData) - $i - 1;
+}
+
+// Calculate scores
+$mainNumberScores = calculateNumberScores(
+    $mainDrawCounts,
+    $mainCurrentSkips,
+    $mainHistoricalProbabilities,
+    count($powerballData) * count($mainBallColumns),
+    $weights
+);
+// -- Extra-ball scoring on the same sliced history --------------------------
+if ($enableExtra && $lotteryConfig['has_extra_ball']) {
+    // Recompute skips & histograms on the sliced extra-ball data
+    list(
+        $sliceExtraSkips,
+        $sliceExtraDrawCounts,
+        $sliceExtraLastDrawDate,
+        $sliceExtraPrevIndex,
+        $sliceExtraHistProbs
+    ) = calculateSkipsAndProbabilities($powerballNumberData, true);
+
+    // Normalize current skips for the slice
+    $sliceExtraCurrentSkips = [];
+    foreach ($sliceExtraPrevIndex as $n => $i) {
+        $sliceExtraCurrentSkips[$n] = count($powerballNumberData) - $i - 1;
+    }
+
+    // Now compute the extra-ball scores using the sliced histogram
+    $powerballNumberScores = calculateNumberScores(
+        $sliceExtraDrawCounts,
+        $sliceExtraCurrentSkips,
+        $sliceExtraHistProbs,          // ? use the SLICED-history array
+        count($powerballNumberData),
+        $pbWeights
+    );
+    arsort($powerballNumberScores);
+    // Pick your top 3
+    $topExtraNumbers = array_slice(array_keys($powerballNumberScores), 0, 3, true);
+} else {
+    $powerballNumberScores = [];
+    $topExtraNumbers       = [];
+}
+
+
+
+// Helper: coarse grid search for weights that maximize composite Top-20 ranking score
+// Uses skaiRankMetrics(): Recall@20 + NDCG@20 + Mean Winner Rank
+function skaiTuneWeightsOnWindow(
+    array $fullMainHistory,
+    array $mainBallColumns,
+    int $window,
+    int $backtestCount
+): array {
+    $grid = [0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80];
+
+    $best = [
+        'score'   => -1,
+        'weights' => ['frequency'=>0.4,'skip'=>0.3,'historical'=>0.3],
+        'matches' => 0.0,
+        'recall'  => 0.0,
+        'ndcg'    => 0.0,
+        'mean_rank' => 21.0,
+    ];
+
+    $totalDraws = count($fullMainHistory);
+    if ($totalDraws < 30) return $best;
+
+    $bt = min($backtestCount, $totalDraws - 1);
+    if ($bt < 8) return $best;
+
+    foreach ($grid as $f) {
+        foreach ($grid as $s) {
+            $h = 1.0 - ($f + $s);
+            if ($h < 0.10 || $h > 0.80) continue;
+
+            $weights = ['frequency'=>$f,'skip'=>$s,'historical'=>$h];
+
+            $sumScore = 0.0;
+            $sumMatches = 0.0;
+            $sumRecall = 0.0;
+            $sumNdcg = 0.0;
+            $sumMeanRank = 0.0;
+
+            for ($i = 1; $i <= $bt; $i++) {
+                $testIndex = $totalDraws - $i;
+
+                // Training slice of exactly $window draws ending before testIndex
+                $start = max(0, $testIndex - $window);
+                $trainingSet = array_slice($fullMainHistory, $start, $window, true);
+
+                list($_sk, $drawCounts, $_dt, $prevIndex, $histProbs) =
+                    calculateSkipsAndProbabilities($trainingSet);
+
+                $currentSkips = [];
+                foreach ($prevIndex as $num => $idx) {
+                    $currentSkips[$num] = $window - $idx - 1;
+                }
+
+                $totalEvents = $window * count($mainBallColumns);
+
+                $scores = calculateNumberScores($drawCounts, $currentSkips, $histProbs, $totalEvents, $weights);
+                arsort($scores);
+                $predicted = array_slice(array_keys($scores), 0, 20);
+
+                $actual = $fullMainHistory[$testIndex]['numbers'];
+
+                $m = skaiRankMetrics($predicted, $actual, 20);
+
+                $sumScore    += $m['score'];
+                $sumMatches  += $m['matches'];
+                $sumRecall   += $m['recall'];
+                $sumNdcg     += $m['ndcg'];
+                $sumMeanRank += $m['mean_rank'];
+            }
+
+            $avgScore = $sumScore / $bt;
+
+            if ($avgScore > $best['score']) {
+                $best['score'] = $avgScore;
+                $best['weights'] = $weights;
+
+                $best['matches']   = $sumMatches / $bt;
+                $best['recall']    = $sumRecall / $bt;
+                $best['ndcg']      = $sumNdcg / $bt;
+                $best['mean_rank'] = $sumMeanRank / $bt;
+            }
+        }
+    }
+
+    return $best;
+}
+function skaiTuneWeightsOnWindow(array $fullHistory, array $mainBallColumns, int $window, int $backtestCount): array
+{
+    // Coarse grid (fast, stable). You can tighten later.
+    $grid = [0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80];
+
+    $best = [
+        'score'   => -1,
+        'weights' => ['frequency'=>0.4,'skip'=>0.3,'historical'=>0.3],
+    ];
+
+    $totalDraws = count($fullHistory);
+    if ($totalDraws < 20) return $best;
+
+    $bt = min($backtestCount, $totalDraws - 1);
+    if ($bt < 5) return $best;
+
+    foreach ($grid as $f) {
+        foreach ($grid as $s) {
+            $h = 1.0 - ($f + $s);
+            if ($h < 0.10 || $h > 0.80) continue; // keep reasonable combos
+
+            $weights = ['frequency'=>$f,'skip'=>$s,'historical'=>$h];
+
+            $sumMatches = 0;
+
+            for ($i = 1; $i <= $bt; $i++) {
+                $testIndex = $totalDraws - $i;
+
+                // Training slice of exactly $window draws ending before testIndex
+                $start = max(0, $testIndex - $window);
+                $trainingSet = array_slice($fullHistory, $start, $window, true);
+
+                list($_, $drawCounts, $_2, $prevIndex, $histProbs) =
+                    calculateSkipsAndProbabilities($trainingSet);
+
+                // Current skips
+                $currentSkips = [];
+                foreach ($prevIndex as $num => $idx) {
+                    $currentSkips[$num] = $window - $idx - 1;
+                }
+
+                $totalEvents = $window * count($mainBallColumns);
+
+                // Score and pick Top 20
+                $scores = calculateNumberScores($drawCounts, $currentSkips, $histProbs, $totalEvents, $weights);
+                arsort($scores);
+                $predicted = array_slice(array_keys($scores), 0, 20);
+
+                // Compare
+                $actual = $fullHistory[$testIndex]['numbers'];
+                $sumMatches += count(array_intersect($predicted, $actual));
+            }
+
+            $avg = ($bt > 0) ? ($sumMatches / $bt) : 0;
+            if ($avg > $best['score']) {
+                $best['score'] = $avg;
+                $best['weights'] = $weights;
+            }
+        }
+    }
+
+    return $best;
+}
+
+// -- Auto-tune cross-validation (only if requested) ------------------
+if ($tune) {
+
+    $cvResults      = [];
+    $totalDraws     = count($powerballData);
+    // $backtestCount  = min(20, $totalDraws - 1);
+$backtestCount  = min(500, $totalDraws - 1); 
+    // try every window size from 2 up to 20 draws
+    for ($window = 2; $window <= 50; $window++) {
+        $sumMainMatches = 0;
+
+        // For each of the most recent $backtestCount draws:
+        for ($i = 1; $i <= $backtestCount; $i++) {
+            $testIndex = $totalDraws - $i;
+
+            // 1) Build the training slice of length $window ending just before testIndex
+            $start       = max(0, $testIndex - $window);
+            $trainingSet = array_slice($powerballData, $start, $window, true);
+
+            // 2) Compute skip & historical stats on that slice
+            list($_, $drawCounts, $_, $prevIndex, $histProbs) =
+                calculateSkipsAndProbabilities($trainingSet);
+
+            // 3) Compute “current skips” for that slice
+            $currentSkips = [];
+            foreach ($prevIndex as $num => $idx) {
+                $currentSkips[$num] = $window - $idx - 1;
+            }
+
+            // 4) Score and pick top-20 predictions
+            $totalEvents = $window * count($mainBallColumns);
+if (!empty($pureMode)) {
+    // PURE: rank by P(hit | current skip) only
+    $pureScores = [];
+    foreach ($currentSkips as $num => $s) {
+        $pureScores[$num] = $histProbs[$num][$s] ?? 0.0;
+    }
+    // Deterministic order for ties: probability desc, then number asc
+    array_multisort(array_values($pureScores), SORT_DESC, array_keys($pureScores), SORT_ASC);
+    $predicted = array_slice(array_keys($pureScores), 0, 20);
+} else {
+    // BLENDED (existing)
+    $scores = calculateNumberScores(
+        $drawCounts, $currentSkips, $histProbs, $totalEvents, $weights
+    );
+    arsort($scores);
+    $predicted = array_slice(array_keys($scores), 0, 20);
+}
+
+            // 5) Compare against the held-out draw
+            $actual = $powerballData[$testIndex]['numbers'];
+            $sumMainMatches += count(array_intersect($predicted, $actual));
+        }
+
+        // 6) Record the average
+if ($backtestCount > 0) {
+    $cvResults[$window] = round($sumMainMatches / $backtestCount, 2);
+} else {
+    // no test cases? just push zero
+    $cvResults[$window] = 0;
+}
+}
+
+    // Pick the window size with the highest average matches
+    arsort($cvResults);
+$bestWindow = (int) key($cvResults);
+
+// NEW: After choosing best window size, also tune F/S/H weights on that window
+// (Skip pure_mode; pure mode is already “no weights.”)
+if (empty($pureMode)) {
+    $wt = skaiTuneWeightsOnWindow($fullMainHistory, $mainBallColumns, $bestWindow, $backtestCount);
+
+    if (!empty($wt['weights']) && isset($wt['score'])) {
+        $weights = $wt['weights'];
+
+        // Keep human-readable % for Save + display fields later
+        $freqWeightInput = round($weights['frequency'] * 100, 1);
+        $skipWeightInput = round($weights['skip'] * 100, 1);
+        $histWeightInput = round($weights['historical'] * 100, 1);
+
+        // Also refresh normalized floats used everywhere else
+        $freqWeight = $weights['frequency'];
+        $skipWeight = $weights['skip'];
+        $histWeight = $weights['historical'];
+    }
+}
+
+}
+
+// -- Back-test over the selected window -----------------------------
+// restore full history for back-testing
+$powerballData       = $fullMainHistory;
+$powerballNumberData = $fullExtraHistory;
+
+$totalDraws = count($powerballData);
+
+// decide fixed window size for back-testing (null = expanding window)
+$window = $numDraws > 0
+        ? min($numDraws, $totalDraws)
+        : null;
+
+$backtestResults = [];
+
+// idx starts at 1 because idx=0 has no prior draws to train on
+for ($idx = 1; $idx < $totalDraws; $idx++) {
+    if ($window !== null) {
+        // fixed-length slice of size $window ending at idx-1
+        $start  = max(0, $idx - $window);
+        $length = min($window, $idx);
+    } else {
+        // expanding window: everything before idx
+        $start  = 0;
+        $length = $idx;
+    }
+
+    // 1) training slices
+    $trainMain  = array_slice($powerballData,       $start, $length, true);
+    $trainExtra = array_slice($powerballNumberData, $start, $length, true);
+
+    // 2) compute skip & historical on each slice
+    list(, $drawCnts, , $prevIdxs,   $histProbs)   =
+        calculateSkipsAndProbabilities($trainMain);
+    list(, $pbCnts,   , $pbPrevIdxs, $pbHistProbs) =
+        calculateSkipsAndProbabilities($trainExtra, true);
+
+    // 3) normalize skips
+    $currSkipsMain = [];
+    foreach ($prevIdxs as $num => $pi) {
+        $currSkipsMain[$num] = $length - $pi - 1;
+    }
+    $currSkipsExtra = [];
+    foreach ($pbPrevIdxs as $num => $pi) {
+        $currSkipsExtra[$num] = $length - $pi - 1;
+    }
+
+    // 4) score & pick mains
+if (!empty($pureMode)) {
+    // PURE main: P(hit | current skip)
+    $pureScoresMain = [];
+    foreach ($currSkipsMain as $num => $s) {
+        $pureScoresMain[$num] = $histProbs[$num][$s] ?? 0.0;
+    }
+    // Deterministic order for ties
+    array_multisort(array_values($pureScoresMain), SORT_DESC, array_keys($pureScoresMain), SORT_ASC);
+    $predMain = array_slice(array_keys($pureScoresMain), 0, 20, true);
+} else {
+    // BLENDED (existing)
+    $scoresMain = calculateNumberScores(
+        $drawCnts,
+        $currSkipsMain,
+        $histProbs,
+        $length * count($mainBallColumns),
+        $weights
+    );
+    arsort($scoresMain);
+    $predMain = array_slice(array_keys($scoresMain), 0, 20, true);
+}
+    // 5) score & pick extra balls
+    $predExtra = [];
+if ($enableExtra && $lotteryConfig['has_extra_ball']) {
+    if (!empty($pureMode)) {
+        // PURE extra: P(hit | current skip)
+        $pureScoresPB = [];
+        foreach ($currSkipsExtra as $num => $s) {
+            $pureScoresPB[$num] = $pbHistProbs[$num][$s] ?? 0.0;
+        }
+        // Deterministic, no shuffle
+        array_multisort(array_values($pureScoresPB), SORT_DESC, array_keys($pureScoresPB), SORT_ASC);
+        $predExtra = array_slice(array_keys($pureScoresPB), 0, 5);
+    } else {
+        // BLENDED (existing)
+        $scoresPB = calculateNumberScores(
+            $pbCnts,
+            $currSkipsExtra,
+            $pbHistProbs,
+            $length,
+            $pbWeights
+        );
+        arsort($scoresPB);
+        $cands = array_keys(array_slice($scoresPB, 0, 10, true));
+        shuffle($cands);
+        $predExtra = array_slice($cands, 0, 5);
+    }
+}
+
+    // 6) normalize types and get actual draw at idx
+    if (!empty($predExtra)) {
+        $predExtra = array_map('intval', $predExtra); // ensure strict compare works for 1–9
+    }
+    $actualMain  = $powerballData[$idx]['numbers'];
+    $actualExtra = (int) ($powerballNumberData[$idx]['number'] ?? 0);
+
+    // --- NEW: Ranking quality metrics for Top-20 --------------------
+    $matches = count(array_intersect($predMain, $actualMain));
+    $pickCount = is_array($actualMain) ? count($actualMain) : 0;
+    if ($pickCount < 1) { $pickCount = 5; } // safe fallback
+
+    // Recall@20: fraction of winners captured in Top 20
+    $recall20 = $matches / $pickCount;
+
+    // Mean Winner Rank: average 1..20 rank of the winners; missing winners treated as 21
+    $winnerRanks = [];
+    if (is_array($actualMain)) {
+        foreach ($actualMain as $w) {
+            $pos = array_search($w, $predMain, true); // 0-based
+            $winnerRanks[] = ($pos !== false) ? ($pos + 1) : 21;
+        }
+    }
+    $meanWinnerRank = !empty($winnerRanks)
+        ? (array_sum($winnerRanks) / count($winnerRanks))
+        : 21;
+
+    // NDCG@20: rewards winners ranked higher inside the Top 20
+    $dcg = 0.0;
+    foreach ($winnerRanks as $r) {
+        if ($r >= 1 && $r <= 20) {
+            // gain=1 for each winner, discounted by position
+            $dcg += 1.0 / (log($r + 1) / log(2));
+        }
+    }
+    $ideal = min($pickCount, 20);
+    $idcg = 0.0;
+    for ($i2 = 1; $i2 <= $ideal; $i2++) {
+        $idcg += 1.0 / (log($i2 + 1) / log(2));
+    }
+    $ndcg20 = ($idcg > 0.0) ? ($dcg / $idcg) : 0.0;
+    // ---------------------------------------------------------------
+
+    $backtestResults[] = [
+        'draw_date'        => $powerballData[$idx]['date'],
+        'predicted_main'   => $predMain,
+        'actual_main'      => $actualMain,
+        'main_success'     => $matches,
+
+        // NEW metrics
+        'recall20'         => $recall20,
+        'mean_winner_rank' => $meanWinnerRank,
+        'ndcg20'           => $ndcg20,
+
+        'predicted_extra'  => $predExtra,
+        'actual_extra'     => $actualExtra,
+        'extra_success'    => in_array($actualExtra, $predExtra, true) ? 1 : 0,
+    ];
+}
+
+// show newest 20 back-tests
+$backtestResults = array_reverse($backtestResults);
+$backtestResults = array_slice($backtestResults, 0, 20, true);
+// -- end back-test loop ---------------------------------------------
+// -- Build the actual “training” set for final prediction ------------
+if (!empty($tune)) {
+    // when tuning, use the best window determined above
+    $useDraws = $bestWindow;
+} else {
+    // otherwise, use whatever the user requested (or all draws)
+    $useDraws = $numDraws > 0
+        ? min($numDraws, count($latestResult))
+        : count($latestResult);
+}
+
+
+
+// now slice off exactly $useDraws draws from the tail of the history
+$trainMain  = array_slice($powerballData, -$useDraws, $useDraws, true);
+$trainExtra = array_slice($powerballNumberData, -$useDraws, $useDraws, true);
+
+// override your data arrays so the rest of the code uses this window
+$powerballData       = $trainMain;
+$powerballNumberData = $trainExtra;
+
+
+// -- Final prediction on selected window ---------------------------------
+// 1) Recompute skip/historical stats on the WINDOW data
+list($mainSkips2, $mainDrawCounts2, $_, $mainPrevIdxs2, $mainHistProbs2) =
+    calculateSkipsAndProbabilities($powerballData);
+list($pbSkips2,   $pbDrawCounts2,   $_, $pbPrevIdxs2,   $pbHistProbs2) =
+    calculateSkipsAndProbabilities($powerballNumberData, true);
+
+// 2) Build “current skips” maps
+$mainCurrSkips2 = [];
+foreach ($mainPrevIdxs2 as $num => $idx) {
+    $mainCurrSkips2[$num] = count($powerballData) - $idx - 1;
+}
+$pbCurrSkips2 = [];
+foreach ($pbPrevIdxs2 as $num => $idx) {
+    $pbCurrSkips2[$num] = count($powerballNumberData) - $idx - 1;
+}
+
+// 3) Score & pick TOP 20 main balls
+if (!empty($pureMode)) {
+    // PURE main: P(hit | current skip)
+    $pureScoresMain2 = [];
+    foreach ($mainCurrSkips2 as $num => $s) {
+        $pureScoresMain2[$num] = $mainHistProbs2[$num][$s] ?? 0.0;
+    }
+    array_multisort(array_values($pureScoresMain2), SORT_DESC, array_keys($pureScoresMain2), SORT_ASC);
+    $topMainNumbers = array_slice(array_keys($pureScoresMain2), 0, 20, true);
+} else {
+    // BLENDED (existing)
+    $scoresMain2 = calculateNumberScores(
+        $mainDrawCounts2,
+        $mainCurrSkips2,
+        $mainHistProbs2,
+        count($powerballData) * count($mainBallColumns),
+        $weights
+    );
+    arsort($scoresMain2);
+    $topMainNumbers = array_slice(array_keys($scoresMain2), 0, 20, true);
+}
+
+// 4) Score & pick TOP 3 extra balls (if enabled)
+if ($enableExtra && $lotteryConfig['has_extra_ball']) {
+    if (!empty($pureMode)) {
+        // PURE extra: P(hit | current skip)
+        $pureScoresPB2 = [];
+        foreach ($pbCurrSkips2 as $num => $s) {
+            $pureScoresPB2[$num] = $pbHistProbs2[$num][$s] ?? 0.0;
+        }
+        array_multisort(array_values($pureScoresPB2), SORT_DESC, array_keys($pureScoresPB2), SORT_ASC);
+        $topExtraNumbers = array_slice(array_keys($pureScoresPB2), 0, 5);
+    } else {
+        // BLENDED (existing)
+        $scoresPB2 = calculateNumberScores(
+            $pbDrawCounts2,
+            $pbCurrSkips2,
+            $pbHistProbs2,
+            count($powerballNumberData),
+            $pbWeights
+        );
+        arsort($scoresPB2);
+        $cands = array_slice($scoresPB2, 0, 10, true);
+        $keys  = array_keys($cands);
+        shuffle($keys);
+        $topExtraNumbers = array_slice($keys, 0, 5);
+    }
+} else {
+    $topExtraNumbers = [];
+}
+// -- end final prediction ------------------------------------------------
+
+
+// -- Compute metrics for display ------------------------------------
+$btCount = count($backtestResults) ?: 1;  // ensures denominator = 1
+$sumMain  = array_sum(array_column($backtestResults, 'main_success'));
+$sumExtra = array_sum(array_column($backtestResults, 'extra_success'));
+
+// Average number of main-ball matches per draw
+$avgMainMatches = round($sumMain / $btCount, 2);
+
+// NEW: ranking-quality metrics (Top 20)
+$sumRecall20 = 0.0;
+$sumMeanRank = 0.0;
+$sumNdcg20   = 0.0;
+
+foreach ($backtestResults as $r) {
+    $sumRecall20 += isset($r['recall20']) ? (float)$r['recall20'] : 0.0;
+    $sumMeanRank += isset($r['mean_winner_rank']) ? (float)$r['mean_winner_rank'] : 21.0;
+    $sumNdcg20   += isset($r['ndcg20']) ? (float)$r['ndcg20'] : 0.0;
+}
+
+$avgRecall20      = round($sumRecall20 / $btCount, 3);
+$avgMeanWinnerRank= round($sumMeanRank / $btCount, 2);
+$avgNdcg20        = round($sumNdcg20 / $btCount, 3);
+
+// Extra-ball accuracy as a percentage of draws
+if ($enableExtra && $lotteryConfig['has_extra_ball']) {
+    $avgExtraSuccessPercent = round(($sumExtra / $btCount) * 100, 1);
+} else {
+    $avgExtraSuccessPercent = null;
+}
+// ---------------------------------------------------------------------
+
+
+// Draws analyzed
+$drawsAnalyzed = $numDraws > 0
+    ? min($numDraws, count($latestResult))
+    : count($latestResult);
+
+$labelText = $lotteryName . ' - ' . gmdate('Y-m-d H:i') . ' UTC';
+
+$timestamp = date('Y-m-d H:i');
+if (!empty($tune)) {
+    $labelText = "$lotteryName - Auto-tuned ($bestWindow draws, {$cvResults[$bestWindow]} avg) - $timestamp";
+} else {
+    $labelText = "$lotteryName - $timestamp";
+}
+if (!empty($pureMode)) {
+    // append unique identifier so the dashboard shows it
+    $labelText .= " [PURE-SKIP]";
+}
+if (!empty($pureMode)) {
+    $labelText .= " (Pure Math)";
+}
+
+
+
+?>
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+[[head]]
+    [[meta charset="UTF-8"]]
+    [[meta name="viewport" content="width=device-width, initial-scale=1.0"]]
+
+    <?php
+      // Build dynamic <title> and <meta description>
+      $today     = date('F j, Y'); 
+      $fullTitle     = "$lotteryName Prediction Analysis – $today | LottoExpert";
+      $description   = sprintf(
+        'Skip & Hit prediction for %s: proven algorithm boosts your odds. See your odds now!',
+        $lotteryName
+      );
+    ?>
+    <!-- Dynamic Title -->
+    [[title]]<?php echo htmlspecialchars($fullTitle, ENT_QUOTES, 'UTF-8'); ?>[[/title]]
+
+    <!-- Dynamic Meta Description -->
+    [[meta name="description"
+          content="<?php echo htmlspecialchars($description, ENT_QUOTES, 'UTF-8'); ?>" /]]
+
+    [[link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap"
+    ]]
+
+[[link
+  rel="stylesheet"
+  href="https://cdn.datatables.net/1.11.5/css/jquery.dataTables.min.css"
+  media="print"
+  onload="this.media='all'"
+]]
+[[link
+  rel="stylesheet"
+  href="https://cdn.datatables.net/fixedcolumns/4.0.1/css/fixedColumns.dataTables.min.css"
+  media="print"
+  onload="this.media='all'"
+]]
+[[noscript]]
+  [[link
+    rel="stylesheet"
+    href="https://cdn.datatables.net/1.11.5/css/jquery.dataTables.min.css"
+  ]]
+  [[link
+    rel="stylesheet"
+    href="https://cdn.datatables.net/fixedcolumns/4.0.1/css/fixedColumns.dataTables.min.css"
+  ]]
+[[/noscript]]
+
+
+[[style]]
+
+/* Ensure fallback text shows immediately */
+
+
+/* ================= BASE ================= */
+#lottoexpert-container,
+#lottoexpert-container body {
+  font-family: 'Roboto', sans-serif;
+}
+
+/* ================= PANELS & LAYOUT ================= */
+#lottoexpert-container .panel,
+#lottoexpert-container .card,
+#lottoexpert-container .save-form,
+#lottoexpert-container .predictions-panel {
+  width: 90%;
+  max-width: 1200px;
+  margin: 20px auto;
+  padding: 20px;
+  background: #fff;
+  border: 1px solid #dee2e6;
+  border-radius: 10px;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+  box-sizing: border-box;
+  min-height: 320px;             /* ? increased slightly */
+  transition: all 0.25s ease;    /* ? smooth expand/contraction */
+  overflow-anchor: none;         /* ? helps prevent CLS from anchors */
+}
+
+
+#lottoexpert-container .panel-header {
+  background: #007bff;
+  color: #fff;
+  padding: 10px 20px;
+  border-radius: 8px 8px 0 0;
+  font-size: 20px;
+  font-weight: bold;
+  text-align: center;
+  margin: -20px -20px 20px;
+}
+
+#lottoexpert-container .prediction-panel {
+  background-color: #fffae6;
+  border: 2px solid #ffc107;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+#lottoexpert-container .prediction-panel .panel-header {
+  background-color: #ffc107;
+  color: #000;
+}
+
+/* ================= BUTTONS ================= */
+#lottoexpert-container .btn-submit,
+#lottoexpert-container .btn-save {
+  background-color: #28a745;
+  color: #fff;
+  font-size: 16px;
+  padding: 14px 32px;
+  border: none;
+  border-radius: 6px;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+  animation: pulse 1.5s infinite;
+  display: block;
+  margin: 20px auto;
+  max-width: 300px;
+  width: 60%;
+}
+#lottoexpert-container .btn-submit:hover,
+#lottoexpert-container .btn-save:hover {
+  box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+}
+
+
+@keyframes pulse {
+  0%   { box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+  50%  { box-shadow: 0 8px 16px rgba(0,0,0,0.3); }
+  100% { box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+}
+
+
+/* ================= FORMS ================= */
+#lottoexpert-container input[type="number"],
+#lottoexpert-container select {
+  width: 100%;
+  padding: 10px;
+  font-size: 14px;
+  font-weight: bold;
+  color: #495057;
+  border: 2px solid #007bff;
+  border-radius: 5px;
+  background-color: #ffffff;
+  margin-bottom: 10px;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+#lottoexpert-container input[type="number"]:focus,
+#lottoexpert-container select:focus {
+  border-color: #0056b3;
+  box-shadow: 0 0 5px rgba(0,91,187,0.5);
+}
+#lottoexpert-container label {
+  display: block;
+  margin-bottom: 2px;
+  font-weight: 600;
+}
+
+/* ================= TABLES ================= */
+#lottoexpert-container .table-responsive {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin-bottom: 10px;
+}
+#lottoexpert-container table {
+  width: 100%;
+  font-size: 12px;
+  line-height: 1.4;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+/* Fixed column widths to prevent reflow on init */
+#skipHitChart th:nth-child(1),
+#powerballSkipChart th:nth-child(1),
+#backtestTable th:nth-child(1) {
+  width: 80px;
+}
+#skipHitChart th:nth-child(2),
+#powerballSkipChart th:nth-child(2),
+#backtestTable th:nth-child(2) {
+  width: 80px;
+}
+#skipHitChart th:nth-child(3),
+#powerballSkipChart th:nth-child(3),
+#backtestTable th:nth-child(3) {
+  width: 100px;
+}
+
+#lottoexpert-container th, #lottoexpert-container td {
+  text-align: center;
+  border: 1px solid #ddd;
+  padding: 5px;
+}
+
+#lottoexpert-container th {
+  background-color: #f9f9f9;
+  font-weight: 600;
+  color: #333;
+}
+#lottoexpert-container .highlight {
+  background: #ffff00 !important;
+  color: #000;
+  font-weight: bold;
+  border-radius: 4px;
+  padding: 2px 5px;
+}
+
+/* ================= METRICS ================= */
+#lottoexpert-container .metrics {
+  display: flex;
+  justify-content: center;
+  gap: 40px;
+  margin: 16px 0;
+}
+#lottoexpert-container .metric-label {
+  font-weight: 600;
+  color: #555;
+}
+#lottoexpert-container .metric-value {
+  font-size: 1.6em;
+  color: #007bff;
+  margin-top: 4px;
+  display: block;
+}
+
+/* ================= SKIP CHART CIRCLES ================= */
+#lottoexpert-container span.circles,
+#lottoexpert-container span.circlesPb {
+  display: inline-block;
+  padding: 4px;
+  min-width: 37px;
+  text-align: center;
+  font-weight: bold;
+  border-radius: 50%;
+  margin: 0 4px 4px 0;
+}
+#lottoexpert-container span.circles {
+  background: radial-gradient(circle at 50% 20%, #eee, #bbb 75%, #999 100%);
+  color: #333;
+}
+#lottoexpert-container span.circlesPb {
+  background: radial-gradient(circle at 50% 20%, #f97f92, #a3071e 75%, #333 100%);
+  color: #fff;
+}
+
+/* ================= DETAILS / ACCORDIONS ================= */
+#lottoexpert-container details {
+  border: 1px solid #007bff;
+  border-radius: 5px;
+  margin-bottom: 10px;
+  background: #f1f8ff;
+}
+#lottoexpert-container details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  padding: 10px 15px;
+  font-weight: bold;
+  background-color: #007bff;
+  color: #fff;
+  border-radius: 5px;
+}
+#lottoexpert-container details > summary::after {
+  content: "?";
+  font-size: 0.9em;
+  transition: transform 0.2s ease;
+}
+#lottoexpert-container details[open] > summary::after {
+  transform: rotate(90deg);
+}
+#lottoexpert-container details > div {
+  padding: 10px 15px;
+  border-top: 1px solid #007bff;
+  background: #fff;
+  color: #333;
+}
+
+/* ================= RESPONSIVE ================= */
+@media only screen and (max-width: 600px) {
+  #lottoexpert-container {
+    font-size: 12px;
+    padding: 10px;
+  }
+
+  #lottoexpert-container .btn-submit,
+  #lottoexpert-container .btn-save {
+    width: 90% !important;
+    font-size: 14px !important;
+    padding: 10px 15px !important;
+    margin: 10px auto !important;
+  }
+
+  #lottoexpert-container h1,
+  #lottoexpert-container h2,
+  #lottoexpert-container .panel-header {
+    font-size: 16px !important;
+  }
+
+  #lottoexpert-container .prediction-tile span.circles,
+  #lottoexpert-container .prediction-tile span.circlesPb {
+    min-width: 28px;
+    font-size: 12px;
+    padding: 3px;
+    margin: 2px;
+  }
+
+  #lottoexpert-container input,
+  #lottoexpert-container select,
+  #lottoexpert-container label {
+    font-size: 13px !important;
+  }
+
+  #lottoexpert-container .weight-group {
+    flex: 1 1 100%;
+  }
+}
+[[/style]]
+
+
+
+[[/head]]
+[[body]]
+
+[[div id="lottoexpert-container"]]
+
+<!-- Page Title -->
+[[div style="text-align:center; padding:10px 0; margin:10px auto;"]]
+  [[h1 style="font-size:28px; font-weight:600; margin:0;"]]
+    <?php echo htmlspecialchars($lotteryName); ?> Prediction Analysis
+  [[/h1]]
+[[/div]]
+
+<!-- New User Guide (world-class clarity, same panel width + rounded corners) -->
+[[div class="panel" style="
+  background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+  border: 1px solid #dee2e6;
+  border-radius: 12px;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.10);
+  position: relative;
+"]]
+  [[div style="
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:14px;
+  "]]
+    [[div style="flex:1; min-width:0;"]]
+      [[div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;"]]
+        [[div aria-hidden="true" style="
+          width:10px; height:10px; border-radius:999px; background:#007bff; margin-top:6px;
+          box-shadow:0 0 0 4px rgba(0,123,255,0.12);
+        "]][[/div]]
+        [[h2 style="margin:0; font-size:18px; font-weight:700; line-height:1.2; color:#111;"]]
+          Start Here: What This Page Does
+        [[/h2]]
+      [[/div]]
+
+      [[p style="margin:0 0 10px; font-size:14px; color:#333; line-height:1.55;"]]
+        This tool ranks numbers using a transparent math model built from past draws.
+        It combines three measurable signals:
+        [[strong]]Frequency[[/strong]] (how often a number appears),
+        [[strong]]Skip[[/strong]] (how long since it last appeared),
+        and [[strong]]Historical bounce-back[[/strong]] (how often it returns after a given skip).
+      [[/p]]
+
+[[div style="
+  margin:10px 0 12px;
+  padding:10px 12px;
+  border:1px solid #e9ecef;
+  border-radius:10px;
+  background:#ffffff;
+"]]
+  [[div style="font-weight:700; color:#111; margin-bottom:4px;"]]
+    Where to find things on this page
+  [[/div]]
+[[div style="font-size:13px; color:#333; line-height:1.45;"]]
+    The ranked picks appear in the [[strong]]Next Drawing Prediction[[/strong]] section.
+    The detailed [[strong]]Skip Charts[[/strong]] are further down the page and show the raw history behind the scoring.
+    If you’re not a member, you can still review the charts to understand number behavior — members get the ranked outputs and save features.
+[[/div]]
+
+[[div style="margin-top:8px;"]]
+  [[a href="#skip-charts" style="
+    display:inline-block;
+    font-size:13px;
+    font-weight:600;
+    color:#007bff;
+    text-decoration:none;
+    padding:6px 10px;
+    border-radius:8px;
+    border:1px solid rgba(0,123,255,0.25);
+    background:#f1f8ff;
+  "]]
+    ↓ Jump to Skip Charts
+  [[/a]]
+[[/div]]
+[[/div]]
+
+[[div style="
+        display:flex;
+        flex-wrap:wrap;
+        gap:10px;
+        margin:10px 0 0;
+      "]]
+        [[div style="flex:1 1 240px; background:#ffffff; border:1px solid #e9ecef; border-radius:10px; padding:10px 12px;"]]
+          [[div style="font-weight:700; color:#111; margin-bottom:4px;"]]If you’re new[[/div]]
+          [[div style="font-size:13px; color:#333; line-height:1.45;"]]
+            Leave the defaults as-is and click [[strong]]Run Analysis[[/strong]].
+            Then use the [[strong]]Main Numbers[[/strong]] tile as your starting point.
+          [[/div]]
+        [[/div]]
+
+        [[div style="flex:1 1 240px; background:#ffffff; border:1px solid #e9ecef; border-radius:10px; padding:10px 12px;"]]
+          [[div style="font-weight:700; color:#111; margin-bottom:4px;"]]If you want simple mode[[/div]]
+          [[div style="font-size:13px; color:#333; line-height:1.45;"]]
+            Turn on [[strong]]Pure Math Mode[[/strong]] to rank numbers strictly by
+            [[strong]]P(hit | current skip)[[/strong]] (no weight blending).
+          [[/div]]
+        [[/div]]
+
+        [[div style="flex:1 1 240px; background:#ffffff; border:1px solid #e9ecef; border-radius:10px; padding:10px 12px;"]]
+          [[div style="font-weight:700; color:#111; margin-bottom:4px;"]]How to interpret results[[/div]]
+          [[div style="font-size:13px; color:#333; line-height:1.45;"]]
+            Higher-ranked numbers show stronger statistical signals in the selected history window.
+            This is [[strong]]probability guidance[[/strong]] — not guarantees.
+          [[/div]]
+        [[/div]]
+      [[/div]]
+    [[/div]]
+  [[/div]]
+[[/div]]
+
+
+  <!-- Analysis Settings Panel -->
+ <!-- Analysis Settings Panel (refactored) -->
+[[div class="panel"]]
+[[div class="panel-header"]]Customize the Analysis (Optional) — <?php echo htmlspecialchars($lotteryName); ?>[[/div]]
+  [[form method="get"]]
+    [[input 
+      type="hidden" 
+      name="game_id" 
+      value="<?php echo htmlspecialchars($selectedGameId, ENT_QUOTES, 'UTF-8'); ?>" 
+    ]]
+    
+    <!--
+    [[fieldset class="analysis-group"]]
+      [[legend]]Options[[/legend]]
+      [[p class="helper-text"]]Toggle whether to include the extra ball (Powerball) in the analysis.[[/p]]
+      [[label]]
+        [[input type="checkbox" name="enable_extra" value="1" <?php if($enableExtra) echo 'checked'; ?>]]
+        Analyze Extra Ball Separately
+      [[/label]]
+    [[/fieldset]]
+-->
+[[fieldset class="analysis-group"]]
+  [[legend]]Draw Window[[/legend]]
+[[p class="helper-text" style="font-weight:500; color:#333; margin-bottom:10px;"]]
+  Choose how many past draws to include in the analysis. 
+  [[strong]]Note:[[/strong]] The settings below will only take effect once you click the [[strong]]“Run Analysis”[[/strong]] button. 
+  Predictions are never auto-refreshed.
+[[/p]]
+
+[[input 
+  type="hidden" 
+  name="tune" 
+  id="tune" 
+  value="<?php echo (int)$tune; ?>"
+]]
+
+<!-- Option 1: Auto-Tune -->
+[[label style="display:block; margin-bottom:8px;"]]
+  [[input 
+    type="radio" 
+    name="draw_mode" 
+    id="mode_tune" 
+    value="tune" 
+    onchange="toggleDrawMode()" 
+    <?php echo ($tune && !$pureMode) ? 'checked' : ''; ?>
+    <?php echo $pureMode ? 'disabled' : ''; ?>
+  ]]
+  [[strong]]Auto-Tune + Predict[[/strong]]
+  [[p class="helper-text" style="margin-left:24px; font-style:italic; font-weight:normal;"]]
+    Tests multiple draw windows (2–50) to find the best-performing one based on backtest accuracy.
+    [[span style="font-weight:bold;"]]Reminder:[[/span]]
+    Auto-Tune never runs automatically — you must press [[strong]]“Run Analysis”[[/strong]].
+  [[/p]]
+[[/label]]
+
+<!-- Option 2: Manual -->
+[[label style="display:block; margin-bottom:8px; margin-top:12px;"]]
+  [[input 
+    type="radio" 
+    name="draw_mode" 
+    id="mode_manual" 
+    value="manual" 
+    onchange="toggleDrawMode()"
+    <?php echo (!$tune || $pureMode) ? 'checked' : ''; ?>
+  ]]
+  [[strong]]Manually Enter Draw Count[[/strong]]
+  [[input
+    type="number"
+    name="num_draws"
+    id="num_draws_custom"
+    min="0"
+    max="9999"
+    step="1"
+    placeholder="e.g. 50"
+    value="<?php echo (int)$numDraws; ?>"
+    <?php echo ($tune && !$pureMode) ? 'disabled' : ''; ?>
+    style="width:100px; margin-left:8px;"
+  ]]
+  [[p class="helper-text" style="margin-left:24px; font-style:italic;"]]
+    Use this to set a fixed number of recent draws. Set to 0 to analyze all draws.
+    Changes apply only when you click [[strong]]“Run Analysis.”[[/strong]]
+  [[/p]]
+[[/label]]
+
+
+[[/fieldset]]
+
+[[script]]
+function handlePureMode() {
+  const pureOn     = document.querySelector('input[name="pure_mode"][value="1"]').checked;
+  const tuneInput  = document.getElementById('tune');
+  const modeTune   = document.getElementById('mode_tune');
+  const modeManual = document.getElementById('mode_manual');
+  const manualDraw = document.getElementById('num_draws_custom');
+
+  if (pureOn) {
+    if (modeTune) { modeTune.checked = false; modeTune.disabled = true; }
+    if (modeManual) { modeManual.checked = true; }
+    if (manualDraw) { manualDraw.disabled = false; }
+    if (tuneInput) { tuneInput.value = 0; }
+  } else {
+    if (modeTune) { modeTune.disabled = false; }
+    toggleDrawMode();
+  }
+}
+
+function toggleDrawMode() {
+  const pureOn     = document.querySelector('input[name="pure_mode"][value="1"]').checked;
+  const tuneInput  = document.getElementById('tune');
+  const modeTune   = document.getElementById('mode_tune');
+  const manualDraw = document.getElementById('num_draws_custom');
+
+  if (pureOn) return handlePureMode();
+
+  if (modeTune && modeTune.checked) {
+    if (tuneInput) { tuneInput.value = 1; }
+    if (manualDraw) { manualDraw.disabled = true; manualDraw.value = ''; }
+  } else {
+    if (tuneInput) { tuneInput.value = 0; }
+    if (manualDraw) { manualDraw.disabled = false; }
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('input[name="pure_mode"]').forEach(el => {
+    el.addEventListener('change', handlePureMode);
+  });
+  handlePureMode();
+});
+[[/script]]
+
+
+
+[[fieldset class="analysis-group"]]
+  [[legend]]Pure Math Mode (Skip–Hit only)[[/legend]]
+  [[p class="helper-text"]]
+    When enabled, predictions use only the empirical probability that a number hits
+    given its current skip (no frequency/skip/“historical weights” blending).
+  [[/p]]
+
+  [[label style="display:block; margin-bottom:8px;"]]
+    [[input
+      type="radio"
+      name="pure_mode"
+      value="0"
+      <?php echo ($pureMode ? '' : 'checked'); ?>
+    ]]
+    [[strong]]Off[[/strong]] — Use the weight blend you set below.
+  [[/label]]
+
+  [[label style="display:block; margin-bottom:8px;"]]
+    [[input
+      type="radio"
+      name="pure_mode"
+      value="1"
+      <?php echo ($pureMode ? 'checked' : ''); ?>
+    ]]
+    [[strong]]On[[/strong]] — Strict skip?hit probabilities only (Top 20 from P(hit | current skip)).
+  [[/label]]
+[[/fieldset]]
+
+[[fieldset class="analysis-group"]]
+  [[legend]]Main Ball Weight Configuration[[/legend]]
+      [[p class="helper-text"]]Adjust how the algorithm balances “hot” (frequency), “overdue” (skip), and pattern-based (historical) factors for the main balls.[[/p]]
+      [[div class="weight-controls"]]
+        [[label for="freq_weight"]][[strong]]Frequency Weight (0–100%):[[/strong]][[/label]]
+        [[input type="number" id="freq_weight" name="freq_weight" min="0" max="100" step="0.1" value="<?php echo $freqWeightInput; ?>"]]
+
+        [[label for="skip_weight"]][[strong]]Skip Weight (0–100%):[[/strong]][[/label]]
+        [[input type="number" id="skip_weight" name="skip_weight" min="0" max="100" step="0.1" value="<?php echo $skipWeightInput; ?>"]]
+
+        [[label for="hist_weight"]][[strong]]Historical Weight (0–100%):[[/strong]][[/label]]
+        [[input type="number" id="hist_weight" name="hist_weight" min="0" max="100" step="0.1" value="<?php echo $histWeightInput; ?>"]]
+      [[/div]]
+      [[p id="weight-warning" class="helper-text" style="display:none;color:#d9534f;"]]
+        Total must equal 100%.
+      [[/p]]
+    [[/fieldset]]
+
+    <?php if($enableExtra && $lotteryConfig['has_extra_ball']): ?>
+    [[fieldset class="analysis-group"]]
+      [[legend]]Extra Ball Weight Configuration[[/legend]]
+      [[p class="helper-text"]]Same three weights, but applied only to the extra (Powerball) number.[[/p]]
+      [[div class="weight-controls"]]
+        [[label for="pb_freq_weight"]][[strong]]Frequency Weight (0–100%):[[/strong]][[/label]]
+        [[input type="number" id="pb_freq_weight" name="pb_freq_weight" min="0" max="100" step="0.1" value="<?php echo $pbFreqWeightInput; ?>"]]
+
+        [[label for="pb_skip_weight"]][[strong]]Skip Weight (0–100%):[[/strong]][[/label]]
+        [[input type="number" id="pb_skip_weight" name="pb_skip_weight" min="0" max="100" step="0.1" value="<?php echo $pbSkipWeightInput; ?>"]]
+
+        [[label for="pb_hist_weight"]][[strong]]Historical Weight (0–100%):[[/strong]][[/label]]
+        [[input type="number" id="pb_hist_weight" name="pb_hist_weight" min="0" max="100" step="0.1" value="<?php echo $pbHistWeightInput; ?>"]]
+      [[/div]]
+      [[p id="pb-weight-warning" class="helper-text" style="display:none;color:#d9534f;"]]
+        Total must equal 100%.
+      [[/p]]
+    [[/fieldset]]
+    <?php endif; ?>
+
+[[input type="submit" id="updateButton" class="btn-submit" value="Run Analysis"]]
+
+  [[/form]]
+[[/div]]
+
+
+[[!-- Expanded Weight Parameter Definitions --]]
+[[section class="panel" id="weight-parameter-definitions"]]
+  [[h2 class="panel-header"]]Weight Parameter Definitions[[/h2]]
+
+  [[details]]
+    [[summary]]Frequency Weight[[/summary]]
+    [[p]]This controls how much you favor the “popular” numbers—the ones drawn most often in history. Think of it like choosing the celebrities of the lottery world: they’ve shown up on stage many times![[/p]]
+    [[p]][[strong]]Why it matters:[[/strong]] If you believe “what happened most often will happen again,” crank this up. If you want to give lesser seen numbers a chance, turn it down.[[/p]]
+    [[ul]]
+      [[li]][[strong]]100%[[/strong]] ? You only pick the hottest numbers.[[/li]]
+      [[li]][[strong]]50%[[/strong]] ? Half your score is popularity, half comes from other factors.[[/li]]
+      [[li]][[strong]]0%[[/strong]] ? Popularity doesn’t matter at all—every number starts on equal footing.[[/li]]
+    [[/ul]]
+  [[/details]]
+
+  [[details]]
+    [[summary]]Skip Weight[[/summary]]
+    [[p]]“Skip” measures how many draws have passed since each number last showed up. A high Skip weight chases the underdogs—numbers that haven’t appeared in a while.[[/p]]
+    [[p]][[strong]]Why it matters:[[/strong]] If you think “it’s been too long—time to come back,” boost Skip. If you don’t care how fresh a number is, lower it.[[/p]]
+    [[ul]]
+      [[li]][[strong]]100%[[/strong]] ? You pick only the most overdue numbers.[[/li]]
+      [[li]][[strong]]50%[[/strong]] ? You balance overdue status with popularity and patterns.[[/li]]
+      [[li]][[strong]]0%[[/strong]] ? You ignore overdue status entirely—every number is treated the same.[[/li]]
+    [[/ul]]
+  [[/details]]
+
+  [[details]]
+    [[summary]]Historical Probability Weight[[/summary]]
+    [[p]]This looks at real “bounce back” stories—how likely a number is to reappear after missing a certain number of draws. It’s the AI’s way of learning from past comebacks.[[/p]]
+    [[p]][[strong]]Why it matters:[[/strong]] If you trust that history knows best which overdue numbers come back most, turn this up. If you want simpler rules, turn it down.[[/p]]
+    [[ul]]
+      [[li]][[strong]]100%[[/strong]] ? You pick the numbers with the strongest comeback records.[[/li]]
+      [[li]][[strong]]50%[[/strong]] ? You mix comeback patterns equally with popularity and skip.[[/li]]
+      [[li]][[strong]]0%[[/strong]] ? You ignore comeback patterns—only Frequency and Skip decide your picks.[[/li]]
+    [[/ul]]
+  [[/details]]
+
+  <?php if($enableExtra && $lotteryConfig['has_extra_ball']): ?>
+  [[details]]
+    [[summary]]Extra Ball Frequency Weight[[/summary]]
+    [[p]]Like Frequency for main balls, but only for the special extra (Powerball) number. A high setting means you always pick the most-drawn Powerball. A low setting gives every Powerball equal shot.[[/p]]
+    [[ul]]
+      [[li]][[strong]]100%[[/strong]] ? Only the most-popular Powerball wins.[[/li]]
+      [[li]][[strong]]50%[[/strong]] ? Half popularity, half other factors.[[/li]]
+      [[li]][[strong]]0%[[/strong]] ? Popularity ignored entirely.[[/li]]
+    [[/ul]]
+  [[/details]]
+
+  [[details]]
+    [[summary]]Extra Ball Skip Weight[[/summary]]
+    [[p]]Like Skip for main balls, but for the Powerball. High values chase Powerballs that are long overdue; low values treat all extra balls equally regardless of “waiting time.”[[/p]]
+    [[ul]]
+      [[li]][[strong]]100%[[/strong]] ? Only the most overdue Powerballs are selected.[[/li]]
+      [[li]][[strong]]50%[[/strong]] ? Balanced between overdue and other factors.[[/li]]
+      [[li]][[strong]]0%[[/strong]] ? No overdue bias—every extra ball is equal.[[/li]]
+    [[/ul]]
+  [[/details]]
+
+  [[details]]
+    [[summary]]Extra Ball Historical Probability Weight[[/summary]]
+    [[p]]Like Historical Probability for main balls, but focused on the extra ball’s bounce-back records. High values trust past comeback patterns; low values ignore them.[[/p]]
+    [[ul]]
+      [[li]][[strong]]100%[[/strong]] ? Picks the Powerball with the strongest comeback history.[[/li]]
+      [[li]][[strong]]50%[[/strong]] ? Mixes comeback patterns equally with other factors.[[/li]]
+      [[li]][[strong]]0%[[/strong]] ? Ignores comeback history entirely.[[/li]]
+    [[/ul]]
+  [[/details]]
+  <?php endif; ?>
+
+[[/section]]
+
+  <!-- Prediction Analysis Panel -->
+  [[div class="panel prediction-panel"]]
+    [[div class="panel-header"]]Next Drawing Prediction Analysis for <?php echo htmlspecialchars($lotteryName); ?>[[/div]]
+
+
+<?php if (!empty($tune) && isset($bestWindow, $cvResults[$bestWindow])): ?>
+[[div style="background:#e6f4ea; border-left:5px solid #34a853; padding:10px 15px; border-radius:6px; margin-bottom:10px;"]]
+  [[center]][[strong style="color:#1a7f37;"]] Auto-tune Active: [[/strong]][[/center]]
+  Best draw size: [[strong]]<?php echo $bestWindow; ?> draws[[/strong]] &nbsp;|&nbsp;
+  Avg backtest accuracy: [[strong]]<?php echo $cvResults[$bestWindow]; ?> main matches[[/strong]]
+[[/div]]
+
+<?php endif; ?>
+
+
+    <!-- Backtest Metrics -->
+    [[div style="display:flex;justify-content:space-around;flex-wrap:wrap;gap:14px;margin:15px 0;"]]
+
+      [[div style="text-align:center;min-width:160px;"]]
+        [[p style="font-weight:bold; margin-bottom:4px;"]]Avg Matches (Top 20)[[/p]]
+        [[p style="font-size:18px;color:#007bff;margin-top:0;"]]
+          <?php echo isset($avgMainMatches) ? $avgMainMatches : 0; ?>
+        [[/p]]
+      [[/div]]
+
+      [[div style="text-align:center;min-width:160px;"]]
+        [[p style="font-weight:bold; margin-bottom:4px;"]]Recall@20[[/p]]
+        [[p style="font-size:18px;color:#007bff;margin-top:0;"]]
+          <?php echo isset($avgRecall20) ? $avgRecall20 : 0; ?>
+        [[/p]]
+      [[/div]]
+
+      [[div style="text-align:center;min-width:160px;"]]
+        [[p style="font-weight:bold; margin-bottom:4px;"]]Mean Winner Rank[[/p]]
+        [[p style="font-size:18px;color:#007bff;margin-top:0;"]]
+          <?php echo isset($avgMeanWinnerRank) ? $avgMeanWinnerRank : 0; ?>
+        [[/p]]
+      [[/div]]
+
+      [[div style="text-align:center;min-width:160px;"]]
+        [[p style="font-weight:bold; margin-bottom:4px;"]]NDCG@20[[/p]]
+        [[p style="font-size:18px;color:#007bff;margin-top:0;"]]
+          <?php echo isset($avgNdcg20) ? $avgNdcg20 : 0; ?>
+        [[/p]]
+      [[/div]]
+      <?php if ($enableExtra && $lotteryConfig['has_extra_ball']): ?>
+      [[div style="text-align:center;"]]
+        [[p style="font-weight:bold;"]]Powerball Accuracy[[/p]]
+                  [[p style="font-size:18px;color:#c62828;"]]
+            <?php echo isset($avgExtraSuccessPercent) ? $avgExtraSuccessPercent . '%' : '0%'; ?>
+          [[/p]]
+
+      [[/div]]
+      <?php endif; ?>
+    [[/div]]
+[[p style="font-size:13px; color:#666; text-align:center; font-style:italic; margin-top:-10px; margin-bottom:10px; max-width:90%; margin-left:auto; margin-right:auto;"]]
+  Note: This score uses all recent draws, so it may differ slightly from the backtest average.
+[[/p]]
+
+
+<?php if (!empty($tune)): ?>
+  
+<?php endif; ?>
+[[center]][[p style="margin-top:5px;"]]
+  Our AI ranks the numbers with the highest probability for the upcoming <?php echo htmlspecialchars($lotteryName); ?> draw:
+[[/p]][[/center]]
+
+
+    <!-- Predictions Tile -->
+    [[div class="prediction-tile" style="background:#fff3cd; border:1px solid #ffeeba; padding:12px 20px; border-radius:10px; margin-bottom:20px;"]]
+      <?php if ($userIsInAllowedGroup): ?>
+
+        <!-- Main Numbers (most probable first) -->
+        [[div class="numbers-group"]]
+          [[div class="number-label" style="font-weight:600; font-size:16px; margin-bottom:4px;"]]
+            Main Numbers
+            [[span style="font-weight:400; font-size:13px; color:#555;"]]
+              (ranked – most probable first)
+            [[/span]]
+          [[/div]]
+[[div id="mainPredictionContainer"]]
+  [[span]]Loading main prediction…[[/span]]
+[[/div]]
+
+[[script]]
+requestIdleCallback(() => {
+  const mainNums = <?php echo json_encode(array_map('intval', $topMainNumbers)); ?>;
+  const container = document.getElementById('mainPredictionContainer');
+  if (!container) return;
+
+  const frag = document.createDocumentFragment();
+  mainNums.forEach(num => {
+    const span = document.createElement('span');
+    span.className = 'circles';
+    span.textContent = num;
+    frag.appendChild(span);
+  });
+  container.innerHTML = '';
+  container.appendChild(frag);
+});
+[[/script]]
+
+          [[p style="font-size:12px; color:#666; margin-top:6px;"]]
+            Note: first number shown has the highest predicted probability.
+          [[/p]]
+        [[/div]]
+
+        <!-- Extra Ball (highest probability first) -->
+        <?php if ($enableExtra && $lotteryConfig['has_extra_ball']): ?>
+        [[div class="numbers-group" style="margin-top:10px;"]]
+          [[div class="number-label" style="font-weight:600; font-size:16px; margin-bottom:4px;"]]
+            Extra Ball
+            [[span style="font-weight:400; font-size:13px; color:#555;"]]
+              (sorted – highest probability first)
+            [[/span]]
+          [[/div]]
+[[div id="extraPredictionContainer"]]
+  [[span]]Loading extra ball prediction…[[/span]]
+[[/div]]
+
+[[script]]
+requestIdleCallback(() => {
+  const extraNums = <?php echo json_encode(array_map('intval', $topExtraNumbers)); ?>;
+  const container = document.getElementById('extraPredictionContainer');
+  if (!container) return;
+
+  const frag = document.createDocumentFragment();
+  extraNums.forEach(num => {
+    const span = document.createElement('span');
+    span.className = 'circlesPb';
+    span.textContent = num;
+    frag.appendChild(span);
+  });
+  container.innerHTML = '';
+  container.appendChild(frag);
+});
+[[/script]]
+
+          [[p style="font-size:12px; color:#666; margin-top:6px;"]]
+            Note: the leftmost extra ball is the one most likely to be drawn.
+          [[/p]]
+        [[/div]]
+        <?php endif; ?>
+
+<?php else: ?>
+
+  [[div style="
+    text-align:center;
+    padding:14px 16px;
+    border:1px solid #e9ecef;
+    border-radius:12px;
+    background:linear-gradient(180deg,#ffffff 0%,#f8fafc 100%);
+    max-width:520px;
+    margin:20px auto;
+  "]]
+
+    [[p style="font-size:17px; font-weight:700; color:#111; margin:0 0 6px;"]]
+      Member Access Required
+    [[/p]]
+
+    [[p style="font-size:14px; color:#333; margin:0 0 8px; line-height:1.5;"]]
+      Ranked number selections and saved prediction sets are available to members.
+      These results summarize the strongest statistical signals for the next
+      <?php echo htmlspecialchars($lotteryName); ?> draw.
+    [[/p]]
+
+    [[p style="font-size:13px; color:#555; margin:0 0 10px; line-height:1.45;"]]
+      You can still explore the underlying probability patterns in the
+      [[strong]]Skip Charts[[/strong]] below, which show the raw historical behavior
+      used in the calculations.
+    [[/p]]
+
+    [[a href="#skip-charts" style="
+      display:inline-block;
+      font-size:13px;
+      font-weight:600;
+      color:#007bff;
+      text-decoration:none;
+      padding:6px 12px;
+      border-radius:8px;
+      border:1px solid rgba(0,123,255,0.25);
+      background:#f1f8ff;
+    "]]
+      View Skip Charts
+    [[/a]]
+
+  [[/div]]
+
+  <?php endif; ?>
+    [[/div]]
+
+
+    
+
+    <!-- Save Prediction Form -->
+[[div class="save-form"]]
+
+<?php
+// CHANGE ? Preserve full SEF route (option/view/params) on POST
+$saveAction = htmlspecialchars(
+    $_SERVER['REQUEST_URI'],
+    ENT_QUOTES,
+    'UTF-8'
+);
+
+?>
+
+
+
+  [[h4 style="margin-bottom:10px; font-size:15px; font-weight:bold;"]]Save This Prediction Set[[/h4]]
+  [[form method="post" action="<?php echo $saveAction; ?>"]]
+  
+    <?php echo JHtml::_('form.token'); ?>
+
+    <!-- existing hidden fields -->
+    [[input type="hidden" name="source"             value="skip_hit"]]
+    [[input type="hidden" name="lottery_id"         value="<?php echo $lotteryId; ?>"]]   <!-- -- FIX -->
+    [[input type="hidden" name="main_numbers"       value="<?php echo implode(',', array_map('intval', $topMainNumbers)); ?>"]]
+    [[input type="hidden" name="extra_ball_numbers" value="<?php echo implode(',', array_map('intval', $topExtraNumbers)); ?>"]]
+    [[input type="hidden" name="draws_analyzed"     value="<?php echo $drawsAnalyzed; ?>"]]
+    [[input type="hidden" name="generated_at"       value="<?php echo date('Y-m-d H:i:s'); ?>"]]
+[[input type="hidden" name="next_draw_date"     value="<?php echo htmlspecialchars($nextDrawDate, ENT_QUOTES, 'UTF-8'); ?>"]]
+[[input type="hidden" name="pure_mode"          value="<?php echo (int)$pureMode; ?>"]]
+[[input type="hidden" name="draws_used"         value="<?php echo (int)$useDraws; ?>"]]
+[[input type="hidden" name="tune_used"          value="<?php echo (int)!empty($tune); ?>"]]
+<?php if (!empty($tune) && isset($bestWindow)) : ?>
+[[input type="hidden" name="best_window"        value="<?php echo (int)$bestWindow; ?>"]]
+<?php endif; ?>
+
+
+    <!-- main-ball weights (always defined) -->
+    [[input type="hidden" name="freq_weight"   value="<?php echo round($freqWeightInput, 2); ?>"]]
+    [[input type="hidden" name="skip_weight"   value="<?php echo round($skipWeightInput, 2); ?>"]]
+    [[input type="hidden" name="hist_weight"   value="<?php echo round($histWeightInput, 2); ?>"]]
+
+    <?php if ($enableExtra && $lotteryConfig['has_extra_ball']) : ?>
+      <!-- extra-ball weights (only render if those PHP vars actually exist) -->
+      [[input type="hidden" name="pb_freq_weight" value="<?php echo round($pbFreqWeightInput, 2); ?>"]]
+      [[input type="hidden" name="pb_skip_weight" value="<?php echo round($pbSkipWeightInput, 2); ?>"]]
+      [[input type="hidden" name="pb_hist_weight" value="<?php echo round($pbHistWeightInput, 2); ?>"]]
+    <?php endif; ?>
+
+
+[[label 
+  style="display:block; font-weight:bold; margin:6px 0 2px;" 
+  title="Saved in Coordinated Universal Time (UTC)"
+]]
+  Label [[span style="font-size:11px; color:#888;"]](UTC)[[/span]]
+[[/label]]
+[[input
+  type="text"
+  name="label"
+  value="<?php echo htmlspecialchars($labelText, ENT_QUOTES, 'UTF-8'); ?>"
+  readonly
+  style="width:100%; font-size:13px;"
+]]
+[[p style="font-size:11px; color:#777; margin-top:2px;"]]
+  This label uses UTC time. Your local time is: 
+  [[span id="local-time-label" style="font-weight:bold; color:#333;"]][[/span]]
+[[/p]]
+
+
+    [[label style="display:block; font-weight:bold; margin:6px 0 2px;"]]Draws Analyzed[[/label]]
+    [[input
+      type="text"
+      value="<?php echo $drawsAnalyzed; ?>"
+      readonly
+      style="width:100%; font-size:13px;"
+    ]]
+
+    [[label style="display:block; font-weight:bold; margin:6px 0 2px;"]]Weights (F/S/H)[[/label]]
+    [[input
+      type="text"
+      readonly
+      value="<?php
+        echo round($freqWeightInput,1) . '% / '
+           . round($skipWeightInput,1) . '% / '
+           . round($histWeightInput,1) . '%';
+      ?>"
+      style="width:100%; font-size:13px;"
+    ]]
+
+    <?php if ($userIsInAllowedGroup): ?>
+      [[button 
+  type="submit" 
+  name="save_set" 
+  class="btn-save" 
+  style="margin-top:10px;"
+]]
+  Save to My Dashboard
+[[/button]]
+
+    <?php else: ?>
+      [[p style="color:#888; font-style:italic; margin-top:10px; font-size:13px;"]]
+        Log in to save predictions.
+      [[/p]]
+    <?php endif; ?>
+
+  [[/form]]
+[[/div]]
+  <!-- End of Prediction Analysis Panel -->
+
+
+
+<?php if (!empty($tune)): ?>
+[[div class="panel"]]
+  [[div class="panel-header"]]Best Draw-Size Tuning Results[[/div]]
+  [[div class="table-responsive"]]
+    [[table class="display nowrap"]]
+      [[thead]]
+        [[tr]][[th]]Draw Size[[/th]][[th]]Avg Main Matches[[/th]][[/tr]]
+      [[/thead]]
+      [[tbody]]
+        <?php foreach ($cvResults as $wnd => $avg): ?>
+        [[tr<?php if ($wnd === $bestWindow) echo ' style="background:#e0f7fa;"'; ?>]]
+          [[td]]<?php echo $wnd; ?>[[/td]]
+          [[td]]<?php echo $avg; ?>[[/td]]
+        [[/tr]]
+        <?php endforeach; ?>
+      [[/tbody]]
+    [[/table]]
+  [[/div]]
+[[/div]]
+<?php endif; ?>
+
+
+
+
+
+  <!-- Backtest Results Panel -->
+  <?php if (!empty($backtestResults)): ?>
+  [[div class="panel"]]
+      [[div class="panel-header"]]Backtest Results for <?php echo htmlspecialchars($lotteryName); ?>[[/div]]
+      [[p]]Below are the results of backtesting our prediction model:[[/p]]
+      [[div class="table-responsive"]]
+          [[table id="backtestTable" class="display nowrap"]]
+              [[thead]]
+                  [[tr]]
+                      [[th]]Draw Date[[/th]]
+                      [[th]]Predicted Main Numbers[[/th]]
+                      [[th]]Actual Main Numbers[[/th]]
+                                            [[th]]Main Success (Matches)[[/th]]
+                      [[th]]Recall@20[[/th]]
+                      [[th]]Mean Winner Rank[[/th]]
+                      [[th]]NDCG@20[[/th]]
+
+                      <?php if ($lotteryConfig['has_extra_ball']): ?>
+                      [[th]]Predicted Extra Ball[[/th]]
+                      [[th]]Actual Extra Ball[[/th]]
+                      [[th]]Extra Ball Success[[/th]]
+                      <?php endif; ?>
+                  [[/tr]]
+              [[/thead]]
+              [[tbody]]
+                  <?php foreach ($backtestResults as $result): ?>
+                  [[tr]]
+                      [[td]]<?php echo htmlspecialchars($result['draw_date'] ?? ''); ?>[[/td]]
+                      [[td]]
+      <?php 
+          $actualMain = is_array($result['actual_main']) 
+              ? array_map(function($val){ return (int)trim($val); }, $result['actual_main']) 
+              : array_map('intval', explode(',', trim($result['actual_main']))); 
+          $predictedMainInts = is_array($result['predicted_main']) 
+              ? array_map('intval', $result['predicted_main']) 
+              : array_map('intval', explode(',', $result['predicted_main'])); 
+          foreach ($predictedMainInts as $num) {
+              $class = in_array($num, $actualMain, true) ? 'highlight' : '';
+              echo "[[span class='{$class}']]" . htmlspecialchars((string)$num) . "[[/span]] ";
+          }
+      ?>
+                      [[/td]]
+                      [[td]]
+      <?php 
+          foreach ($actualMain as $num) {
+              $class = in_array($num, $predictedMainInts, true) ? 'highlight' : '';
+              echo "[[span class='{$class}']]" . htmlspecialchars((string)$num) . "[[/span]] "; 
+          }
+      ?>
+                      [[/td]]
+                                           [[td]]<?php echo $result['main_success'] ?? ''; ?>[[/td]]
+                      [[td]]<?php echo isset($result['recall20']) ? round((float)$result['recall20'], 3) : ''; ?>[[/td]]
+                      [[td]]<?php echo isset($result['mean_winner_rank']) ? round((float)$result['mean_winner_rank'], 2) : ''; ?>[[/td]]
+                      [[td]]<?php echo isset($result['ndcg20']) ? round((float)$result['ndcg20'], 3) : ''; ?>[[/td]]
+
+                      <?php if ($lotteryConfig['has_extra_ball']): ?>
+                      [[td]]
+      <?php 
+          $predictedExtra = is_array($result['predicted_extra']) 
+              ? array_map('intval', $result['predicted_extra']) 
+              : array_map('intval', explode(',', $result['predicted_extra'])); 
+          $actualExtraVal = (int)($result['actual_extra'] ?? 0); 
+          foreach ($predictedExtra as $num) {
+              $class = ((int)$num === $actualExtraVal) ? 'highlight' : '';
+              echo "[[span class='{$class}']]" . htmlspecialchars((string)$num) . "[[/span]] ";
+          }
+      ?>
+                      [[/td]]
+                      [[td]]<?php echo htmlspecialchars((string)$actualExtraVal); ?>[[/td]]
+                      [[td]]<?php echo $result['extra_success'] ?? ''; ?>[[/td]]
+                      <?php endif; ?>
+                  [[/tr]]
+                  <?php endforeach; ?>
+              [[/tbody]]
+          [[/table]]
+      [[/div]]
+  [[/div]]
+  <?php endif; ?>
+
+<!-- Skip Charts Panel -->
+  [[div class="panel" id="skip-charts"]]
+      [[div class="panel-header"]]<?php echo htmlspecialchars($lotteryName); ?> Skip Charts[[/div]]
+
+      [[div role="note" aria-label="Skip chart explanation" style="margin:12px 0 16px; padding:12px 14px; border:1px solid #cfe2ff; background:#f1f8ff; border-radius:8px; font-size:14px; line-height:1.5; color:#223;"]]
+        [[strong]]Quick Guide (like explaining to a kid):[[/strong]]
+        [[ul style="margin:8px 0 0 18px;"]]
+          [[li]]Each [[em]]row[[/em]] is one lottery ball (that’s the left side, under “Ball”).[[/li]]
+          [[li]]“Count” tells how many times that ball has been drawn. “Last Draw” is the date it last showed up. “Skip” is how many drawings it has [[em]]missed[[/em]] since then.[[/li]]
+          [[li]]The boxes labeled [[strong]]0, 1, 2, …, 20[[/strong]] are [[em]]skip distances[[/em]]. Example: under “3” we count how many times that ball hit after missing 3 drawings.[[/li]]
+          [[li]]The [[span style="background:#ffff00; padding:0 4px; border-radius:4px;"]]yellow[[/span]] box in a row marks the ball’s [[em]]current skip[[/em]] (how long it has been waiting right now).[[/li]]
+          [[li]]Simple idea: if a ball has lots of bigger numbers in one column, it often returns after that many skips.[[/li]]
+        [[/ul]]
+      [[/div]]
+
+      <!-- Main Numbers Skip Chart -->
+      [[details open]]
+        [[summary]]Main Numbers Skip Chart[[/summary]]
+        [[div class="table-responsive"]]
+            [[table id="skipHitChart" class="display nowrap"]]
+              [[thead]]
+                  [[tr]]
+                      [[th]]Ball[[/th]]
+                      [[th]]Count[[/th]]
+                      [[th]]Last Draw[[/th]]
+                      [[th]]Skip[[/th]]
+                      [[th]]0[[/th]]
+                      <?php for ($i = 1; $i <= 20; $i++): ?>
+                          [[th]]<?php echo htmlspecialchars((string)$i); ?>[[/th]]
+                      <?php endfor; ?>
+                  [[/tr]]
+              [[/thead]]
+[[tbody]]
+<?php if (!empty($mainPreviousIndex)): ?>
+  <?php 
+    ksort($mainPreviousIndex);
+    foreach ($mainPreviousIndex as $number => $index):
+        // Calculate accurate current skip using full history
+        $drawCount   = $mainDrawCounts[$number] ?? 0;
+        $lastDate    = $mainLastDrawDate[$number] ?? 'N/A';
+        $index       = $mainPreviousIndex[$number] ?? (count($fullMainHistory) - 1);
+        $currentSkip = count($fullMainHistory) - $index - 1;
+  ?>
+  [[tr]]
+    [[td]]<?php echo htmlspecialchars((string)$number); ?>[[/td]]
+    [[td]]<?php echo htmlspecialchars((string)$drawCount); ?>[[/td]]
+    [[td]]<?php echo htmlspecialchars((string)$lastDate); ?>[[/td]]
+    [[td]]<?php echo htmlspecialchars((string)$currentSkip); ?>[[/td]]
+    <?php for ($i = 0; $i <= 20; $i++): ?>
+      <?php 
+        $skipCount = $mainSkips[$number][$i] ?? '';
+        $class     = ($currentSkip == $i) ? 'highlight' : '';
+      ?>
+      [[td class="<?php echo $class; ?>"]]
+        <?php echo htmlspecialchars((string)$skipCount); ?>
+      [[/td]]
+    <?php endfor; ?>
+  [[/tr]]
+  <?php endforeach; ?>
+<?php else: ?>
+  [[tr]][[td colspan="56"]]No data available[[/td]][[/tr]]
+<?php endif; ?>
+[[/tbody]]
+
+            [[/table]]
+        [[/div]]
+      [[/details]]
+
+      <!-- Extra Ball Skip Chart -->
+      <?php if ($lotteryConfig['has_extra_ball']): ?>
+      [[details open]]
+        [[summary]]Extra Ball Skip Chart[[/summary]]
+        [[div class="table-responsive"]]
+            [[table id="powerballSkipChart" class="display nowrap"]]
+              [[thead]]
+                  [[tr]]
+                      [[th]]Extra Ball[[/th]]
+                      [[th]]Count[[/th]]
+                      [[th]]Last Draw[[/th]]
+                      [[th]]Skip[[/th]]
+                      [[th]]0[[/th]]
+                      <?php for ($i = 1; $i <= 20; $i++): ?>
+                          [[th]]<?php echo htmlspecialchars((string)$i); ?>[[/th]]
+                      <?php endfor; ?>
+                  [[/tr]]
+              [[/thead]]
+              [[tbody]]
+                  <?php if (!empty($powerballPreviousIndex)): ?>
+                     <?php 
+ksort($powerballPreviousIndex);
+foreach ($powerballPreviousIndex as $number => $index):
+    $drawCount   = $powerballDrawCounts[$number] ?? 0;
+    $lastDate    = $powerballLastDrawDate[$number] ?? 'N/A';
+    $index       = $powerballPreviousIndex[$number] ?? (count($fullExtraHistory) - 1);
+    $currentSkip = count($fullExtraHistory) - $index - 1;
+?>
+
+                      [[tr]]
+                          [[td]]<?php echo htmlspecialchars((string)$number); ?>[[/td]]
+                          [[td]]<?php echo htmlspecialchars((string)$drawCount); ?>[[/td]]
+                          [[td]]<?php echo htmlspecialchars((string)$lastDate); ?>[[/td]]
+                          [[td]]<?php echo htmlspecialchars((string)$currentSkip); ?>[[/td]]
+                          <?php for ($i = 0; $i <= 20; $i++):
+                              $skipCount = $powerballSkips[$number][$i] ?? '';
+                              $class = ($currentSkip == $i) ? 'highlight' : '';
+                          ?>
+                          [[td class="<?php echo $class; ?>"]]
+                              <?php echo htmlspecialchars((string)$skipCount); ?>
+                          [[/td]]
+                          <?php endfor; ?>
+                      [[/tr]]
+                      <?php endforeach; ?>
+                  <?php else: ?>
+                      [[tr]][[td colspan="56"]]No data available[[/td]][[/tr]]
+                  <?php endif; ?>
+              [[/tbody]]
+            [[/table]]
+        [[/div]]
+      [[/details]]
+      <?php endif; ?>
+
+  [[/div]]  <!-- End of Skip Charts Panel -->
+
+[[script src="https://code.jquery.com/jquery-3.6.0.min.js" async]][[/script]]
+[[script src="https://cdn.datatables.net/1.11.5/js/jquery.dataTables.min.js" async]][[/script]]
+[[script src="https://cdn.datatables.net/fixedcolumns/4.0.1/js/dataTables.fixedColumns.min.js" async]][[/script]]
+
+[[script]]
+$(document).ready(function () {
+  // Lazy-init DataTables only when the <details> panel is opened
+  $('details').on('toggle', function () {
+    const $table = $(this).find('table.display');
+    const tableId = $table.attr('id');
+
+    if (!this.open || $table.data('initialized')) return;
+
+    requestIdleCallback(() => {
+      $table.DataTable({
+        paging: false,
+        searching: true,
+        ordering: false,
+        info: false,
+        scrollX: true,
+        autoWidth: false,
+        fixedColumns: { leftColumns: 3 },
+        columnDefs: [
+          { targets: 0, width: "40px" },
+          { targets: 1, width: "40px" },
+          { targets: 2, width: "60px" },
+          { targets: 3, width: "40px" },
+          { targets: "_all", width: "auto" }
+        ]
+      });
+
+      $table.data('initialized', true);
+    });
+  });
+});
+
+    // Sync Preset Dropdown to Input
+    $('#num_draws_select').on('change', function () {
+        const v = $(this).val();
+        $('#num_draws').val(v).get(0).setCustomValidity('');
+    });
+
+    // Helper to know if Pure mode is on
+    function isPure() {
+        const pure = document.querySelector('input[name="pure_mode"][value="1"]');
+        return pure ? pure.checked : false;
+    }
+
+    // Main weight validation
+    $('#freq_weight, #skip_weight, #hist_weight').on('input', function() {
+        if (isPure()) { $('#weight-warning').hide(); $('.btn-submit').prop('disabled', false); return; }
+        var f = parseFloat($('#freq_weight').val()) || 0;
+        var s = parseFloat($('#skip_weight').val()) || 0;
+        var h = parseFloat($('#hist_weight').val()) || 0;
+        if (f + s + h !== 100) {
+            $('#weight-warning').show();
+            $('.btn-submit').prop('disabled', true);
+        } else {
+            $('#weight-warning').hide();
+            $('.btn-submit').prop('disabled', false);
+        }
+    });
+
+    // Extra-ball weight validation
+    <?php if ($lotteryConfig['has_extra_ball']): ?>
+    $('#pb_freq_weight, #pb_skip_weight, #pb_hist_weight').on('input', function() {
+        if (isPure()) { $('#pb-weight-warning').hide(); $('.btn-submit').prop('disabled', false); return; }
+        var pf = parseFloat($('#pb_freq_weight').val()) || 0;
+        var ps = parseFloat($('#pb_skip_weight').val()) || 0;
+        var ph = parseFloat($('#pb_hist_weight').val()) || 0;
+        if (pf + ps + ph !== 100) {
+            $('#pb-weight-warning').show();
+            $('.btn-submit').prop('disabled', true);
+        } else {
+            $('#pb-weight-warning').hide();
+            $('.btn-submit').prop('disabled', false);
+        }
+    });
+    <?php endif; ?>
+
+    // Final form submission validation
+    $('form').on('submit', function() {
+        if (isPure()) { return true; } // bypass weight checks in Pure mode
+
+        var f = parseFloat($('#freq_weight').val()) || 0;
+        var s = parseFloat($('#skip_weight').val()) || 0;
+        var h = parseFloat($('#hist_weight').val()) || 0;
+        if (f + s + h !== 100) {
+            alert("Please ensure the total of Frequency, Skip, and Historical weights is exactly 100%.");
+            return false;
+        }
+        <?php if ($lotteryConfig['has_extra_ball']): ?>
+        var pf = parseFloat($('#pb_freq_weight').val()) || 0;
+        var ps = parseFloat($('#pb_skip_weight').val()) || 0;
+        var ph = parseFloat($('#pb_hist_weight').val()) || 0;
+        if (pf + ps + ph !== 100) {
+            alert("Please ensure the extra ball weights total 100%.");
+            return false;
+        }
+        <?php endif; ?>
+        return true;
+    });
+
+        
+ [[/script]]
+ 
+ [[script]]
+document.addEventListener('DOMContentLoaded', function() {
+  const localEl = document.getElementById('local-time-label');
+  if (localEl) {
+    const now = new Date();
+    const formatted = now.toLocaleString(undefined, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    localEl.textContent = formatted;
+  }
+});
+[[/script]]
+
+ 
+ 
+[[script]]
+document.addEventListener("DOMContentLoaded", function() {
+  const updateButton = document.getElementById("updateButton");
+  if (updateButton) {
+    updateButton.addEventListener("click", function() {
+      <?php if (!empty($saveable)): ?>
+        console.log("Saveable is true. You may implement JS logic here.");
+      <?php else: ?>
+        console.warn("Saveable is false. Nothing will be updated.");
+      <?php endif; ?>
+      return true;
+    });
+  }
+});
+[[/script]]
+[[/body]]
+[[/html]]
+{/source}
