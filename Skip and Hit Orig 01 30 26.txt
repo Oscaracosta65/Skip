@@ -370,7 +370,7 @@ $columns = [
     $insert = $db->getQuery(true)
         ->insert('#__user_saved_numbers')
         ->columns($columns)
-        ->values($values);
+        ->values('(' . $values . ')');
 
 //added Oscar
 $db->setQuery($insert)->execute();
