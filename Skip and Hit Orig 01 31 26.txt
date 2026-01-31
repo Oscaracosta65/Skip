@@ -177,8 +177,8 @@ $enableExtra = $app->input->getInt('enable_extra', 1);
 $pureMode    = $app->input->getInt('pure_mode', 0);
 
 
-// Auto-tune flag
-$tune = $app->input->getInt('tune', 0);
+// Auto-tune flag (default to 1 for Auto-Tune + Predict mode on first load)
+$tune = $app->input->getInt('tune', 1);
 
 // -- FIX: Clear tune mode on any POST so Save always runs in normal mode
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
