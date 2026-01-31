@@ -177,8 +177,8 @@ $enableExtra = $app->input->getInt('enable_extra', 1);
 $pureMode    = $app->input->getInt('pure_mode', 0);
 
 
-// Auto-tune flag
-$tune = $app->input->getInt('tune', 0);
+// Auto-tune flag (default to 1 for Auto-Tune + Predict mode on first load)
+$tune = $app->input->getInt('tune', 1);
 
 // -- FIX: Clear tune mode on any POST so Save always runs in normal mode
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -687,6 +687,38 @@ function skaiRankMetrics(array $predictedRankedNums, array $actualWinners, int $
 
 
 // ------------------------------------------------------------
+// Helper: Deterministic sorter for PURE-mode score arrays
+// Returns ranked number keys in correct order (score desc, num asc)
+// Fixes bug: array_multisort(array_values(...), ..., array_keys(...)) 
+// does NOT sort the original associative array
+// ------------------------------------------------------------
+function skaiSortScoresDescNumAsc(array $scores): array
+{
+    if (empty($scores)) {
+        return [];
+    }
+    
+    // Create array of [num => score] for sorting
+    $sortable = [];
+    foreach ($scores as $num => $score) {
+        $sortable[] = ['num' => $num, 'score' => $score];
+    }
+    
+    // Sort by score DESC, then by num ASC (deterministic tie-break)
+    usort($sortable, function($a, $b) {
+        $scoreDiff = $b['score'] - $a['score']; // DESC
+        if (abs($scoreDiff) > 1e-10) {
+            return $scoreDiff <=> 0;
+        }
+        return $a['num'] <=> $b['num']; // ASC for ties
+    });
+    
+    // Return just the number keys in ranked order
+    return array_column($sortable, 'num');
+}
+
+
+// ------------------------------------------------------------
 // NEW: Explain a number's component scores (Freq/Skip/Hist)
 // Used for miss attribution (why 4th/5th were missed)
 // ------------------------------------------------------------
@@ -871,72 +903,12 @@ function skaiTuneWeightsOnWindow(
 
     return $best;
 }
-function skaiTuneWeightsOnWindow(array $fullHistory, array $mainBallColumns, int $window, int $backtestCount): array
-{
-    // Coarse grid (fast, stable). You can tighten later.
-    $grid = [0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80];
 
-    $best = [
-        'score'   => -1,
-        'weights' => ['frequency'=>0.4,'skip'=>0.3,'historical'=>0.3],
-    ];
-
-    $totalDraws = count($fullHistory);
-    if ($totalDraws < 20) return $best;
-
-    $bt = min($backtestCount, $totalDraws - 1);
-    if ($bt < 5) return $best;
-
-    foreach ($grid as $f) {
-        foreach ($grid as $s) {
-            $h = 1.0 - ($f + $s);
-            if ($h < 0.10 || $h > 0.80) continue; // keep reasonable combos
-
-            $weights = ['frequency'=>$f,'skip'=>$s,'historical'=>$h];
-
-            $sumMatches = 0;
-
-            for ($i = 1; $i <= $bt; $i++) {
-                $testIndex = $totalDraws - $i;
-
-                // Training slice of exactly $window draws ending before testIndex
-                $start = max(0, $testIndex - $window);
-                $trainingSet = array_slice($fullHistory, $start, $window, true);
-
-                list($_, $drawCounts, $_2, $prevIndex, $histProbs) =
-                    calculateSkipsAndProbabilities($trainingSet);
-
-                // Current skips
-                $currentSkips = [];
-                foreach ($prevIndex as $num => $idx) {
-                    $currentSkips[$num] = $window - $idx - 1;
-                }
-
-                $totalEvents = $window * count($mainBallColumns);
-
-                // Score and pick Top 20 (diversified selection)
-                $scores = calculateNumberScores($drawCounts, $currentSkips, $histProbs, $totalEvents, $weights);
-                arsort($scores);
-                $rankedAll = array_keys($scores);
-                $predicted = skaiSelectTopKDiversified($rankedAll, $currentSkips, 20);
-
-                // Compare (use ranking-quality score to match the global objective)
-                $actual = $fullHistory[$testIndex]['numbers'];
-                $mW = skaiRankMetrics($predicted, $actual, 20);
-                $sumMatches += (float)$mW['score'];
-
-            }
-
-            $avg = ($bt > 0) ? ($sumMatches / $bt) : 0;
-            if ($avg > $best['score']) {
-                $best['score'] = $avg;
-                $best['weights'] = $weights;
-            }
-        }
-    }
-
-    return $best;
-}
+// ------------------------------------------------------------
+// REMOVED: Duplicate function declaration (lines 906-971)
+// Kept the more complete version above (lines 788-905) with 
+// full metrics tracking (score, weights, matches, recall, ndcg, mean_rank)
+// ------------------------------------------------------------
 
 // -- Auto-tune cross-validation (only if requested) ------------------
 if ($tune) {
@@ -977,9 +949,10 @@ if (!empty($pureMode)) {
     foreach ($currentSkips as $num => $s) {
         $pureScores[$num] = $histProbs[$num][$s] ?? 0.0;
     }
-    // Deterministic order for ties: probability desc, then number asc
-    array_multisort(array_values($pureScores), SORT_DESC, array_keys($pureScores), SORT_ASC);
-    $predicted = array_slice(array_keys($pureScores), 0, 20);
+    // Use deterministic sorter helper (score desc, num asc for ties)
+    $rankedNums = skaiSortScoresDescNumAsc($pureScores);
+    // Apply diversification to PURE-mode as well for consistency
+    $predicted = skaiSelectTopKDiversified($rankedNums, $currentSkips, 20);
 } else {
     // BLENDED (existing)
     $scores = calculateNumberScores(
@@ -1106,9 +1079,10 @@ if (!empty($pureMode)) {
     foreach ($currSkipsMain as $num => $s) {
         $pureScoresMain[$num] = $histProbs[$num][$s] ?? 0.0;
     }
-    // Deterministic order for ties
-    array_multisort(array_values($pureScoresMain), SORT_DESC, array_keys($pureScoresMain), SORT_ASC);
-    $predMain = array_slice(array_keys($pureScoresMain), 0, 20, true);
+    // Use deterministic sorter helper (score desc, num asc for ties)
+    $rankedNums = skaiSortScoresDescNumAsc($pureScoresMain);
+    // Apply diversification to PURE-mode as well for consistency
+    $predMain = skaiSelectTopKDiversified($rankedNums, $currSkipsMain, 20);
 } else {
     // BLENDED (existing)
     $scoresMain = calculateNumberScores(
@@ -1132,11 +1106,13 @@ if ($enableExtra && $lotteryConfig['has_extra_ball']) {
         foreach ($currSkipsExtra as $num => $s) {
             $pureScoresPB[$num] = $pbHistProbs[$num][$s] ?? 0.0;
         }
-        // Deterministic, no shuffle
-        array_multisort(array_values($pureScoresPB), SORT_DESC, array_keys($pureScoresPB), SORT_ASC);
-        $predExtra = array_slice(array_keys($pureScoresPB), 0, 5);
+        // Use deterministic sorter helper (score desc, num asc for ties)
+        $rankedExtra = skaiSortScoresDescNumAsc($pureScoresPB);
+        // DETERMINISTIC Top 5 (no diversification for extra ball, no shuffle)
+        $predExtra = array_slice($rankedExtra, 0, 5);
     } else {
-        // BLENDED (existing)
+        // BLENDED (existing) - DETERMINISTIC Top 5 (no shuffle)
+        // Backtests must be repeatable
         $scoresPB = calculateNumberScores(
             $pbCnts,
             $currSkipsExtra,
@@ -1145,9 +1121,8 @@ if ($enableExtra && $lotteryConfig['has_extra_ball']) {
             $pbWeights
         );
         arsort($scoresPB);
-        $cands = array_keys(array_slice($scoresPB, 0, 10, true));
-        shuffle($cands);
-        $predExtra = array_slice($cands, 0, 5);
+        // Take Top 5 by score (deterministic, no shuffle)
+        $predExtra = array_slice(array_keys($scoresPB), 0, 5);
     }
 }
 
@@ -1322,8 +1297,10 @@ if (!empty($pureMode)) {
     foreach ($mainCurrSkips2 as $num => $s) {
         $pureScoresMain2[$num] = $mainHistProbs2[$num][$s] ?? 0.0;
     }
-    array_multisort(array_values($pureScoresMain2), SORT_DESC, array_keys($pureScoresMain2), SORT_ASC);
-    $topMainNumbers = array_slice(array_keys($pureScoresMain2), 0, 20, true);
+    // Use deterministic sorter helper (score desc, num asc for ties)
+    $rankedNums = skaiSortScoresDescNumAsc($pureScoresMain2);
+    // Apply diversification to PURE-mode as well for consistency
+    $topMainNumbers = skaiSelectTopKDiversified($rankedNums, $mainCurrSkips2, 20);
 } else {
     // BLENDED (existing)
     $scoresMain2 = calculateNumberScores(
@@ -1339,7 +1316,7 @@ if (!empty($pureMode)) {
 }
 
 
-// 4) Score & pick TOP 3 extra balls (if enabled)
+// 4) Score & pick TOP 5 extra balls (if enabled)
 if ($enableExtra && $lotteryConfig['has_extra_ball']) {
     if (!empty($pureMode)) {
         // PURE extra: P(hit | current skip)
@@ -1347,8 +1324,10 @@ if ($enableExtra && $lotteryConfig['has_extra_ball']) {
         foreach ($pbCurrSkips2 as $num => $s) {
             $pureScoresPB2[$num] = $pbHistProbs2[$num][$s] ?? 0.0;
         }
-        array_multisort(array_values($pureScoresPB2), SORT_DESC, array_keys($pureScoresPB2), SORT_ASC);
-        $topExtraNumbers = array_slice(array_keys($pureScoresPB2), 0, 5);
+        // Use deterministic sorter helper (score desc, num asc for ties)
+        $rankedExtra = skaiSortScoresDescNumAsc($pureScoresPB2);
+        // DETERMINISTIC Top 5 (no diversification for extra ball)
+        $topExtraNumbers = array_slice($rankedExtra, 0, 5);
     } else {
         // BLENDED (existing) - DETERMINISTIC Top 5 (no shuffle)
         // Reason:
@@ -1370,6 +1349,20 @@ if ($enableExtra && $lotteryConfig['has_extra_ball']) {
 } else {
     $topExtraNumbers = [];
 }
+
+// -- Sanity checks: ensure arrays have correct format ----------------------
+// Main picks: should be <= 20 unique integers
+$topMainNumbers = array_values(array_unique(array_map('intval', $topMainNumbers)));
+if (count($topMainNumbers) > 20) {
+    $topMainNumbers = array_slice($topMainNumbers, 0, 20);
+}
+
+// Extra picks: should be <= 5 unique integers
+$topExtraNumbers = array_values(array_unique(array_map('intval', $topExtraNumbers)));
+if (count($topExtraNumbers) > 5) {
+    $topExtraNumbers = array_slice($topExtraNumbers, 0, 5);
+}
+
 // -- end final prediction ------------------------------------------------
 
 
@@ -1414,7 +1407,10 @@ $labelText = $lotteryName . ' - ' . gmdate('Y-m-d H:i') . ' UTC';
 
 $timestamp = date('Y-m-d H:i');
 if (!empty($tune)) {
-    $labelText = "$lotteryName - Auto-tuned ($bestWindow draws, {$cvResults[$bestWindow]} avg) - $timestamp";
+    // Fix: access array elements correctly (not printing "Array")
+    $scoreVal = isset($cvResults[$bestWindow]['score']) ? $cvResults[$bestWindow]['score'] : 0.0;
+    $matchVal = isset($cvResults[$bestWindow]['matches']) ? $cvResults[$bestWindow]['matches'] : 0.0;
+    $labelText = "$lotteryName - Auto-tuned ($bestWindow draws, score={$scoreVal}, matches={$matchVal} avg) - $timestamp";
 } else {
     $labelText = "$lotteryName - $timestamp";
 }
@@ -2151,7 +2147,7 @@ document.addEventListener('DOMContentLoaded', () => {
 [[div style="background:#e6f4ea; border-left:5px solid #34a853; padding:10px 15px; border-radius:6px; margin-bottom:10px;"]]
   [[center]][[strong style="color:#1a7f37;"]] Auto-tune Active: [[/strong]][[/center]]
   Best draw size: [[strong]]<?php echo $bestWindow; ?> draws[[/strong]] &nbsp;|&nbsp;
-  Avg backtest accuracy: [[strong]]<?php echo $cvResults[$bestWindow]; ?> main matches[[/strong]]
+  Avg backtest: [[strong]]<?php echo isset($cvResults[$bestWindow]['matches']) ? $cvResults[$bestWindow]['matches'] : 0; ?> matches, score=<?php echo isset($cvResults[$bestWindow]['score']) ? number_format($cvResults[$bestWindow]['score'], 3) : '0.000'; ?>[[/strong]]
 [[/div]]
 
 <?php endif; ?>
