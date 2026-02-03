@@ -2086,9 +2086,9 @@ $(document).ready(function () {
             alert("Please ensure the extra ball weights total 100%.");
             return false;
         }
-    <?php endif; ?>    // ? CLOSE the PHP if-block
-
-    });              // ? close the JS callback now that PHP is happy
+        <?php endif; ?>
+        return true;
+    });
 
         
  [[/script]]
@@ -2123,9 +2123,9 @@ document.addEventListener("DOMContentLoaded", function() {
         console.warn("Saveable is false. Nothing will be updated.");
       <?php endif; ?>
       return true;
-    });  // ? close the click handler
-  }      // ? close if(updateButton)
-});       // ? close DOMContentLoaded
+    });
+  }
+});
 [[/script]]
 [[/body]]
 [[/html]]
